@@ -28,9 +28,13 @@ int main(void) {
     int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_DEDUP);
 
     if (ret != 0) {
-        fprintf(stderr, "fadvise failed: %s\n", strerror(ret));
+        if (ret == EINVAL) {
+            fprintf(stderr, "Error: POSIX_FADV_DEDUP (%d) not recognised.\n", POSIX_FADV_DEDUP);
+        } else {
+            fprintf(stderr, "fadvise failed: %s\n", strerror(ret));
+        }
     } else {
-        printf("Success! System call returned 0.\n");
+        printf("Success! Mapping %p (via fd %d) is now in the OOB Dedup queue.\n", (void*)&fd, fd);
     }
 
     close(fd);

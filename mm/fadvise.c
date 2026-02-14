@@ -27,6 +27,7 @@
  * POSIX_FADV_WILLNEED could set PG_Referenced, and POSIX_FADV_NOREUSE could
  * deactivate the pages and clear PG_Referenced.
  */
+extern int oob_dedup_add_file(struct address_space *mapping);
 
 int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
 {
@@ -180,6 +181,8 @@ int generic_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
         printk(KERN_INFO "OOB_DEDUP: Flags before: 0x%lx\n", file->f_mapping->flags);
 		set_bit(AS_DEDUPABLE, &file->f_mapping->flags);
 		printk(KERN_INFO "OOB_DEDUP: Flags after:  0x%lx (Bit %d set)\n", file->f_mapping->flags, AS_DEDUPABLE);
+		oob_dedup_add_file(file->f_mapping);
+		
 		break;		
 
 	default:
