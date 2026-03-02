@@ -23,6 +23,7 @@
 #include <trace/events/writeback.h>
 #include "internal.h"
 
+extern void oob_dedup_evict_inode(struct inode *inode);
 /*
  * Inode locking rules:
  *
@@ -693,6 +694,7 @@ static void evict(struct inode *inode)
 
 	inode_wait_for_lru_isolating(inode);
 
+
 	/*
 	 * Wait for flusher thread to be done with the inode so that filesystem
 	 * does not start destroying it while writeback is still running. Since
@@ -700,6 +702,8 @@ static void evict(struct inode *inode)
 	 * the inode.  We just have to wait for running writeback to finish.
 	 */
 	inode_wait_for_writeback(inode);
+
+	oob_dedup_evict_inode(inode);
 
 	if (op->evict_inode) {
 		op->evict_inode(inode);

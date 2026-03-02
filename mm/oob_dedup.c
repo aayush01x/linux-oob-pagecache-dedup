@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/highmem.h>
 #include <linux/crc32.h>
+#include <linux/xarray.h>
 
 /* Global Queue and Thread Data */
 static LIST_HEAD(file_dedup_list);
@@ -91,6 +92,43 @@ static void clean_folio_hashtable(void)
     }
 }
 
+static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio, struct address_space *mapping, pgoff_t index)
+{
+    XA_STATE(xas, &mapping->i_pages, index);
+    int err = 0;
+
+    if (orig_folio < dup_folio) {
+        folio_lock(orig_folio);
+        folio_lock(dup_folio);
+    } else {
+        folio_lock(dup_folio);
+        folio_lock(orig_folio);
+    }
+
+    xas_lock_irq(&xas);
+
+    if (xas_load(&xas) != dup_folio) {
+        pr_debug("Folio changed before merge. Aborting.\n");
+        err = -EAGAIN;
+        goto out_unlock;
+    }
+
+    /* Increase reference count of original folio*/
+    folio_get(orig_folio);
+    xas_store(&xas, orig_folio);
+
+    /* Decrease reference count to duplicate folio */
+    folio_put(dup_folio);
+
+    pr_info("Successfully MERGED duplicate folio at index %lu\n", index);
+
+out_unlock:
+    xas_unlock_irq(&xas);
+    folio_unlock(dup_folio);
+    folio_unlock(orig_folio);
+    return err;
+}
+
 static void check_and_store_folio(struct folio *folio, struct address_space *mapping, pgoff_t index)
 {   
     struct page_entry *entry;
@@ -106,15 +144,22 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
             struct folio *orig_folio = filemap_get_folio(entry->mapping, entry->index);
             
             if (!IS_ERR(orig_folio)) {
+                if (orig_folio == folio) {
+                    pr_debug("Folios already share physical memory. Skipping.\n");
+                    folio_put(orig_folio);
+                    found = true;
+                    break;
+                }
                 if (compare_folios(orig_folio, folio)) {
                     pr_info("Exact duplicate verified!\n");
                     pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu)\n", 
                              entry->mapping->host->i_ino, entry->index,
                              mapping->host->i_ino, index);
-                    found = true;
+                    if (deduplicate_folio(orig_folio, folio, mapping, index) == 0) {
+                        found = true;
+                    } 
                 }
                 folio_put(orig_folio); 
-                
                 if (found) break; 
             } else {
                 /* The old page was evicted by the kernel. Clean up the stale hash entry. */
@@ -255,39 +300,64 @@ int oob_dedup_add_file(struct address_space *mapping)
             file_dedup_slot_insert(file_dedup_hash, mapping, slot);
             list_add_tail(&slot->list, &file_dedup_list);
             ihold(mapping->host);
-			pr_info("oob_dedup: Queued file for dedup. Inode: %lu, Mapping: %p\n",mapping->host->i_ino, mapping);
+			pr_info("OOB_DEDUP: Queued file for dedup. Inode: %lu, Mapping: %p\n",mapping->host->i_ino, mapping);
             oob_dedup_wakeup();
         } else {
             err = -ENOMEM;
         }
     } else {
-        pr_debug("oob_dedup: Mapping %p already in queue, skipping.\n", mapping);
+        pr_debug("OOB_DEDUP: Mapping %p already in queue, skipping.\n", mapping);
     }
     spin_unlock(&file_dedup_lock);
     return err;
 }
 
-void oob_dedup_remove_file(struct address_space *mapping)
+
+void oob_dedup_evict_inode(struct inode *inode)
 {
-	struct file_dedup_slot *slot;
+    struct page_entry *entry;
+    struct hlist_node *tmp;
+    int bkt;
+    bool found_in_hash = false;
+    struct file_dedup_slot *slot;
 
-	spin_lock(&file_dedup_lock);
-	slot = file_dedup_slot_lookup(file_dedup_hash, mapping);
-	if (slot) {
-		if (oob_scan.slot == slot) {
-			oob_scan.slot = list_next_entry(slot, list);
-			oob_scan.pgoff = 0;
-		}
+    spin_lock(&file_dedup_lock);
 
-		list_del(&slot->list);
-		hash_del(&slot->hash);
-		iput(mapping->host);
-		file_dedup_slot_free(file_dedup_cache, slot);
-	}
-	spin_unlock(&file_dedup_lock);
+    if (inode->i_mapping) {
+        slot = file_dedup_slot_lookup(file_dedup_hash, inode->i_mapping);
+        if (slot) {
+            if (oob_scan.slot == slot) {
+                struct file_dedup_slot *next = list_next_entry(slot, list);
+                if (list_is_head(&next->list, &file_dedup_list))
+                    oob_scan.slot = NULL;
+                else
+                    oob_scan.slot = next;
+                oob_scan.pgoff = 0;
+            }
+
+            list_del(&slot->list);
+            hash_del(&slot->hash);
+            file_dedup_slot_free(file_dedup_cache, slot);
+        }
+    }
+
+    hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
+        if (entry->mapping && entry->mapping->host == inode) {
+            hash_del(&entry->node);
+            kfree(entry);
+            found_in_hash = true;
+        }
+    }
+
+    spin_unlock(&file_dedup_lock);
+
+    if (found_in_hash) {
+        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
+    }
 }
 
 EXPORT_SYMBOL_GPL(oob_dedup_add_file);
-EXPORT_SYMBOL_GPL(oob_dedup_remove_file);
+// EXPORT_SYMBOL_GPL(oob_dedup_remove_file);
+EXPORT_SYMBOL_GPL(oob_dedup_evict_inode);
 
 subsys_initcall(oob_dedup_init);
