@@ -319,6 +319,7 @@ void oob_dedup_evict_inode(struct inode *inode)
     struct hlist_node *tmp;
     int bkt;
     bool found_in_hash = false;
+    bool found_in_file_hash = false;
     struct file_dedup_slot *slot;
 
     spin_lock(&file_dedup_lock);
@@ -338,6 +339,7 @@ void oob_dedup_evict_inode(struct inode *inode)
             list_del(&slot->list);
             hash_del(&slot->hash);
             file_dedup_slot_free(file_dedup_cache, slot);
+            found_in_file_hash = true;
         }
     }
 
@@ -350,6 +352,10 @@ void oob_dedup_evict_inode(struct inode *inode)
     }
 
     spin_unlock(&file_dedup_lock);
+
+    if (found_in_file_hash) {
+        iput(inode);
+    }
 
     if (found_in_hash) {
         pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
