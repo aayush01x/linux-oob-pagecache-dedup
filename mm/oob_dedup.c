@@ -209,7 +209,7 @@ static void oob_dedup_do_scan(void)
 
         slot = oob_scan.slot;
 		struct inode *inode = slot->mapping->host;
-		ihold(inode); // Increment ref count
+		iput(inode); // Increment ref count
 		spin_unlock(&file_dedup_lock);
 		
 		folio = filemap_get_folio(slot->mapping, oob_scan.pgoff);
@@ -299,7 +299,7 @@ int oob_dedup_add_file(struct address_space *mapping)
         if (slot) {
             file_dedup_slot_insert(file_dedup_hash, mapping, slot);
             list_add_tail(&slot->list, &file_dedup_list);
-            ihold(mapping->host);
+        // ihold(mapping->host);
 			pr_info("OOB_DEDUP: Queued file for dedup. Inode: %lu, Mapping: %p\n",mapping->host->i_ino, mapping);
             oob_dedup_wakeup();
         } else {
@@ -353,9 +353,9 @@ void oob_dedup_evict_inode(struct inode *inode)
 
     spin_unlock(&file_dedup_lock);
 
-    if (found_in_file_hash) {
-        iput(inode);
-    }
+   // if (found_in_file_hash) {
+     //   iput(inode);
+    //}
 
     if (found_in_hash) {
         pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
