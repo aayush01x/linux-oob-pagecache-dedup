@@ -702,9 +702,11 @@ static void evict(struct inode *inode)
 	 * the inode.  We just have to wait for running writeback to finish.
 	 */
 	inode_wait_for_writeback(inode);
-
-	oob_dedup_evict_inode(inode);
-
+	
+	if (inode->i_mapping && test_bit(AS_DEDUPABLE, &inode->i_mapping->flags)){
+		oob_dedup_evict_inode(inode);
+	}
+	
 	if (op->evict_inode) {
 		op->evict_inode(inode);
 	} else {
