@@ -97,6 +97,7 @@ static void clean_folio_hashtable(void)
 static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
                               struct address_space *mapping, pgoff_t index)
 {
+    XA_STATE(xas, &mapping->i_pages, index);
     int err = 0;
 
     folio_lock(dup_folio);
@@ -338,8 +339,6 @@ int oob_dedup_evict_inode(struct inode *inode)
     bool found_in_file_hash = false;
     struct file_dedup_slot *slot;
     struct address_space *mapping = inode->i_mapping;
-    struct folio *f;
-    XA_STATE(xas, &mapping->i_pages, 0);
 
     spin_lock(&file_dedup_lock);
 
