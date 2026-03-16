@@ -23,7 +23,7 @@
 #include <trace/events/writeback.h>
 #include "internal.h"
 
-extern void oob_dedup_evict_inode(struct inode *inode);
+extern int oob_dedup_evict_inode(struct inode *inode);
 /*
  * Inode locking rules:
  *
@@ -703,7 +703,18 @@ static void evict(struct inode *inode)
 	 */
 	inode_wait_for_writeback(inode);
 
-	oob_dedup_evict_inode(inode);
+	if (S_ISREG(inode->i_mode)) {
+	        
+        /* 2. Ensure mapping exists, then check your custom AS_DEDUPABLE bit */
+        if (inode->i_mapping && test_bit(AS_DEDUPABLE, &inode->i_mapping->flags)) { 
+            
+            /* 3. Execute your cleanup and log if it was successful */
+            if (oob_dedup_evict_inode(inode) == 0) {
+                pr_info("OOB_DEDUP: Inode %lu successfully evicted from device %s\n", 
+                        inode->i_ino, inode->i_sb->s_id);
+            }
+        }
+    }
 
 	if (op->evict_inode) {
 		op->evict_inode(inode);

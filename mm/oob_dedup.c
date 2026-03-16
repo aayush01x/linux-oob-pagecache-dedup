@@ -118,7 +118,9 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio, 
     xas_store(&xas, orig_folio);
 
     /* Decrease reference count to duplicate folio */
-    folio_put(dup_folio);
+    dup_folio->mapping = NULL;
+    dup_folio->index=0;
+    // folio_put(dup_folio);
 
     pr_info("Successfully MERGED duplicate folio at index %lu\n", index);
 
@@ -126,6 +128,10 @@ out_unlock:
     xas_unlock_irq(&xas);
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
+
+    if(!err){
+    folio_put(dup_folio);
+    }
     return err;
 }
 
@@ -209,7 +215,15 @@ static void oob_dedup_do_scan(void)
 
         slot = oob_scan.slot;
 		struct inode *inode = slot->mapping->host;
-		iput(inode); // Increment ref count
+	    inode = igrab(inode); /* Safely attempt to grab the inode */
+	            
+        if (!inode) {
+            /* The file is actively being deleted by rm! Skip it. 
+               The evict hook will clean up the slot shortly. */
+            spin_unlock(&file_dedup_lock);
+            continue; 
+        }
+        // spin_unlock(&file_dedup_lock);
 		spin_unlock(&file_dedup_lock);
 		
 		folio = filemap_get_folio(slot->mapping, oob_scan.pgoff);
@@ -313,7 +327,7 @@ int oob_dedup_add_file(struct address_space *mapping)
 }
 
 
-void oob_dedup_evict_inode(struct inode *inode)
+int oob_dedup_evict_inode(struct inode *inode)
 {
     struct page_entry *entry;
     struct hlist_node *tmp;
@@ -321,10 +335,13 @@ void oob_dedup_evict_inode(struct inode *inode)
     bool found_in_hash = false;
     bool found_in_file_hash = false;
     struct file_dedup_slot *slot;
+    struct address_space *mapping = inode->i_mapping;
+    struct folio *f;
+    XA_STATE(xas, &mapping->i_pages, 0);
 
     spin_lock(&file_dedup_lock);
 
-    if (inode->i_mapping) {
+    if (mapping) {
         slot = file_dedup_slot_lookup(file_dedup_hash, inode->i_mapping);
         if (slot) {
             if (oob_scan.slot == slot) {
@@ -353,6 +370,44 @@ void oob_dedup_evict_inode(struct inode *inode)
 
     spin_unlock(&file_dedup_lock);
 
+    if (mapping) {
+        struct folio *clones[16];
+        int count;
+        
+        do {
+            struct folio *f;
+            /* Start from index 0 on each batch to safely catch remaining clones */
+            XA_STATE(xas, &mapping->i_pages, 0); 
+            count = 0;
+            
+            xas_lock_irq(&xas);
+            xas_for_each(&xas, f, ULONG_MAX) {
+                if (xas_retry(&xas, f)) continue;
+
+                /* If it's a clone (wrong mapping or index), queue it for execution */
+                if (f->mapping != mapping || f->index != xas.xa_index) {
+                    
+                    xas_store(&xas, NULL); /* Wipe it from the tree */
+                    mapping->nrpages--;    /* 🚨 CRUCIAL: Tell VFS the page is gone! */
+                    
+                    clones[count++] = f;
+                    if (count == 16) break; /* Stop if our safe batch array is full */
+                }
+            }
+            xas_unlock_irq(&xas);
+
+            /* Safely drop all references outside the spinlock */
+            for (int i = 0; i < count; i++) {
+                folio_put(clones[i]); 
+            }
+            
+        } while (count > 0); /* Repeat until the tree is perfectly clean */
+    }
+
+    if (found_in_hash) {
+        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
+    }
+
    // if (found_in_file_hash) {
      //   iput(inode);
     //}
@@ -360,6 +415,7 @@ void oob_dedup_evict_inode(struct inode *inode)
     if (found_in_hash) {
         pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
     }
+    return 0;
 }
 
 EXPORT_SYMBOL_GPL(oob_dedup_add_file);

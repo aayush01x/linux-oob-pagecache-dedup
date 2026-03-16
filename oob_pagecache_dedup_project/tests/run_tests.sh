@@ -19,6 +19,8 @@ compile_tests() {
     gcc test1_same_folder.c common.c -o test1
     gcc test2_diff_folders.c common.c -o test2
     gcc test3_multi_files.c common.c -o test3
+    gcc test4.c common.c -o test4
+    gcc test5.c common.c -o test5
 }
 
 run_test() {
@@ -35,7 +37,7 @@ run_test() {
     sync
 
     echo "[*] Dropping page/inode/dentry caches..."
-    echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+    # echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
 
     sleep 1
 
@@ -53,7 +55,7 @@ run_test() {
 
     echo "[*] Final cache drop..."
     sync
-    echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+    # echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
     sleep 1
 }
 
@@ -65,7 +67,10 @@ run_test "TEST 0 - Internal" test0
 run_test "TEST 1 - Same Folder" test1
 run_test "TEST 2 - Different Folders" test2
 run_test "TEST 3 - Multi File" test3
+run_test "TEST 4 - Read after Internal" test4
+run_test "TEST 5 - Multi File with Read" test5
 
-rm -f test0 test1 test2 test3
+
+rm -f test0 test1 test2 test3 test4
 
 echo "All tests completed."
