@@ -17,7 +17,7 @@ static LIST_HEAD(file_dedup_list);
 static DEFINE_HASHTABLE(file_dedup_hash, 10);
 static struct kmem_cache *file_dedup_cache;
 static DEFINE_SPINLOCK(file_dedup_lock);
-
+static DEFINE_SPINLOCK(folio_hash_lock);
 static struct task_struct *oob_dedup_thread;
 static DECLARE_WAIT_QUEUE_HEAD(oob_dedup_wait);
 
@@ -86,31 +86,25 @@ static void clean_folio_hashtable(void)
     struct hlist_node *tmp;
     int bkt;
 
+    spin_lock(&folio_hash_lock);
     hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
         hash_del(&entry->node);
         kfree(entry);
     }
+    spin_unlock(&folio_hash_lock);
 }
 
-static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio, struct address_space *mapping, pgoff_t index)
+static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
+                              struct address_space *mapping, pgoff_t index)
 {
-    XA_STATE(xas, &mapping->i_pages, index);
     int err = 0;
 
-    if (orig_folio < dup_folio) {
-        folio_lock(orig_folio);
-        folio_lock(dup_folio);
-    } else {
-        folio_lock(dup_folio);
-        folio_lock(orig_folio);
-    }
+    folio_lock(dup_folio);
 
-    xas_lock_irq(&xas);
-
-    if (xas_load(&xas) != dup_folio) {
-        pr_debug("Folio changed before merge. Aborting.\n");
+    if (folio_mapping(dup_folio) != mapping || folio_index(dup_folio) != index) {
+        pr_debug("Folio changed before removal. Aborting.\n");
         err = -EAGAIN;
-        goto out_unlock;
+        goto out;
     }
 
     /* Increase reference count of original folio*/
@@ -124,8 +118,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio, 
 
     pr_info("Successfully MERGED duplicate folio at index %lu\n", index);
 
-out_unlock:
-    xas_unlock_irq(&xas);
+out:
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
 
@@ -142,42 +135,53 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
     bool found = false;
     u32 hash = hash_folio(folio);
 
+    spin_lock(&folio_hash_lock);
     hash_for_each_possible_safe(oob_folio_hash, entry, tmp, node, hash) {
-        if (entry->hash == hash) {
-            if (entry->mapping == mapping && entry->index == index) // matching against itself
-                continue;
+        if (entry->hash != hash)
+            continue;
+        if (entry->mapping == mapping && entry->index == index)
+            continue;
 
-            struct folio *orig_folio = filemap_get_folio(entry->mapping, entry->index);
-            
-            if (!IS_ERR(orig_folio)) {
-                if (orig_folio == folio) {
-                    pr_debug("Folios already share physical memory. Skipping.\n");
-                    folio_put(orig_folio);
-                    found = true;
-                    break;
-                }
-                if (compare_folios(orig_folio, folio)) {
-                    pr_info("Exact duplicate verified!\n");
-                    pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu)\n", 
-                             entry->mapping->host->i_ino, entry->index,
-                             mapping->host->i_ino, index);
-                    if (deduplicate_folio(orig_folio, folio, mapping, index) == 0) {
-                        found = true;
-                    } 
-                }
-                folio_put(orig_folio); 
-                if (found) break; 
-            } else {
-                /* The old page was evicted by the kernel. Clean up the stale hash entry. */
-                pr_debug("Stale hash entry detected for Inode %lu. Removing.\n", entry->mapping->host->i_ino);
-                hash_del(&entry->node);
-                kfree(entry);
+        struct address_space *entry_mapping = entry->mapping;
+        pgoff_t entry_index = entry->index;
+        spin_unlock(&folio_hash_lock);
+
+        struct folio *orig_folio = filemap_get_folio(entry_mapping, entry_index);
+
+        if (!IS_ERR(orig_folio)) {
+            if (orig_folio == folio) {
+                pr_debug("Folios already share physical memory. Skipping.\n");
+                folio_put(orig_folio);
+                spin_lock(&folio_hash_lock);
+                found = true;
+                break;
             }
+
+            if (compare_folios(orig_folio, folio)) {
+                pr_info("Exact duplicate verified!\n");
+                pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu)\n",
+                         entry_mapping->host->i_ino, entry_index,
+                         mapping->host->i_ino, index);
+                if (deduplicate_folio(orig_folio, folio, mapping, index) == 0) {
+                    found = true;
+                }
+            }
+            folio_put(orig_folio);
+        } else {
+            spin_lock(&folio_hash_lock);
+            pr_debug("Stale hash entry detected for Inode %lu. Removing.\n", entry_mapping->host->i_ino);
+            hash_del(&entry->node);
+            kfree(entry);
+            spin_unlock(&folio_hash_lock);
         }
+
+        spin_lock(&folio_hash_lock);
+        if (found)
+            break;
     }
 
     if (!found) {
-        entry = kmalloc(sizeof(struct page_entry), GFP_KERNEL);
+        entry = kmalloc(sizeof(struct page_entry), GFP_ATOMIC);
         if (entry) {
             entry->hash = hash;
             entry->mapping = mapping;
@@ -185,6 +189,7 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
             hash_add(oob_folio_hash, &entry->node, hash);
         }
     }
+    spin_unlock(&folio_hash_lock);
 }
 
 static void oob_dedup_do_scan(void)
@@ -217,25 +222,22 @@ static void oob_dedup_do_scan(void)
 		struct inode *inode = slot->mapping->host;
 	    inode = igrab(inode); /* Safely attempt to grab the inode */
 	            
-        if (!inode) {
-            /* The file is actively being deleted by rm! Skip it. 
-               The evict hook will clean up the slot shortly. */
+        if (!inode) { // Inode is being deleted
             spin_unlock(&file_dedup_lock);
             continue; 
         }
-        // spin_unlock(&file_dedup_lock);
 		spin_unlock(&file_dedup_lock);
 		
 		folio = filemap_get_folio(slot->mapping, oob_scan.pgoff);
 		if (!IS_ERR(folio)) {
 			check_and_store_folio(folio, slot->mapping, oob_scan.pgoff);
-			folio_put(folio);
+            folio_put(folio);
 		}
 
         pages_done++;
         oob_scan.pgoff++;
 
-		unsigned long max_pages = i_size_read(inode) >> PAGE_SHIFT;
+		unsigned long max_pages = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
         if (oob_scan.pgoff >= max_pages || oob_scan.pgoff >= MAX_PAGES_PER_FILE) {
             spin_lock(&file_dedup_lock);
             oob_scan.slot = list_next_entry(slot, list);
@@ -359,7 +361,9 @@ int oob_dedup_evict_inode(struct inode *inode)
             found_in_file_hash = true;
         }
     }
+    spin_unlock(&file_dedup_lock);
 
+    spin_lock(&folio_hash_lock);
     hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
         if (entry->mapping && entry->mapping->host == inode) {
             hash_del(&entry->node);
@@ -367,8 +371,45 @@ int oob_dedup_evict_inode(struct inode *inode)
             found_in_hash = true;
         }
     }
+    spin_unlock(&folio_hash_lock);
 
-    spin_unlock(&file_dedup_lock);
+    
+
+    if (mapping) {
+        struct folio *clones[16];
+        int count;
+        
+        do {
+            struct folio *f;
+            // Start from index 0 on each batch to safely catch remaining clones 
+            XA_STATE(xas, &mapping->i_pages, 0); 
+            count = 0;
+            
+            xas_lock_irq(&xas);
+            xas_for_each(&xas, f, ULONG_MAX) {
+                if (xas_retry(&xas, f)) continue;
+
+                // If it's a clone (wrong mapping or index), queue it for execution 
+                if (f->mapping != mapping || f->index != xas.xa_index) {
+                    
+                    xas_store(&xas, NULL); 
+                    mapping->nrpages--;                        
+                    clones[count++] = f;
+                    if (count == 16) break;
+                }
+            }
+            xas_unlock_irq(&xas);
+
+            for (int i = 0; i < count; i++) {
+                folio_put(clones[i]); 
+            }
+            
+        } while (count > 0); 
+    }
+
+    if (found_in_hash) {
+        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
+    }
 
     if (mapping) {
         struct folio *clones[16];
@@ -384,7 +425,6 @@ int oob_dedup_evict_inode(struct inode *inode)
             xas_for_each(&xas, f, ULONG_MAX) {
                 if (xas_retry(&xas, f)) continue;
 
-                /* If it's a clone (wrong mapping or index), queue it for execution */
                 if (f->mapping != mapping || f->index != xas.xa_index) {
                     
                     xas_store(&xas, NULL); /* Wipe it from the tree */

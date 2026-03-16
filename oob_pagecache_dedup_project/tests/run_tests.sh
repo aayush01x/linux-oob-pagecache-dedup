@@ -8,6 +8,7 @@ cleanup_files() {
     rm -f folder_alpha/test3_file1.txt
     rm -f folder_beta/test3_file2.txt
     rm -f folder_gamma/test3_file3.txt
+    rm -f test4_readback.txt
 
     rm -rf folder_alpha folder_beta folder_gamma
 
@@ -21,6 +22,7 @@ compile_tests() {
     gcc test3_multi_files.c common.c -o test3
     gcc test4.c common.c -o test4
     gcc test5.c common.c -o test5
+    gcc test4_readback.c common.c -o test6
 }
 
 run_test() {
@@ -70,7 +72,8 @@ run_test "TEST 3 - Multi File" test3
 run_test "TEST 4 - Read after Internal" test4
 run_test "TEST 5 - Multi File with Read" test5
 
+run_test "TEST 4 - Readback" test4
 
-rm -f test0 test1 test2 test3 test4
+rm -f test0 test1 test2 test3 test4 test5 test6
 
 echo "All tests completed."
