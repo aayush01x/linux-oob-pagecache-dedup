@@ -11,6 +11,9 @@
 #include <linux/highmem.h>
 #include <linux/crc32.h>
 #include <linux/xarray.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/atomic.h>
 
 /* Global Queue and Thread Data */
 static LIST_HEAD(file_dedup_list);
@@ -24,6 +27,13 @@ static DECLARE_WAIT_QUEUE_HEAD(oob_dedup_wait);
 static unsigned int sleep_millisecs = 20;
 static unsigned int pages_to_scan = 100;
 #define MAX_PAGES_PER_FILE 1024
+
+/* sysfs kobject and counters for the sysfs layer */
+static struct kobject *oob_dedup_kobj;
+
+static atomic_t stat_files_queued = ATOMIC_INIT(0);
+static atomic_t stat_pages_deduped = ATOMIC_INIT(0);
+static atomic_t stat_pages_scanned = ATOMIC_INIT(0);
 
 /* struct oob_scan - cursor for scanning */
 struct oob_scan {
@@ -116,7 +126,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     dup_folio->mapping = NULL;
     dup_folio->index=0;
     // folio_put(dup_folio);
-
+    atomic_inc(&stat_pages_deduped);
     pr_info("Successfully MERGED duplicate folio at index %lu\n", index);
 
 out:
@@ -236,6 +246,7 @@ static void oob_dedup_do_scan(void)
 		}
 
         pages_done++;
+        atomic_inc(&stat_pages_scanned);
         oob_scan.pgoff++;
 
 		unsigned long max_pages = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
@@ -268,6 +279,50 @@ static int oob_dedup_thread_fn(void *nothing)
 	return 0;
 }
 
+/* sysfs attribute functions */
+static ssize_t files_queued_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", atomic_read(&stat_files_queued));
+}
+
+static ssize_t pages_deduped_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", atomic_read(&stat_pages_deduped));
+}
+
+static ssize_t pages_scanned_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", atomic_read(&stat_pages_scanned));
+}
+
+static ssize_t sleep_millisecs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%u\n", sleep_millisecs);
+}
+
+static ssize_t sleep_millisecs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    unsigned int val;
+    if (kstrtouint(buf, 10, &val) == 0) {
+        sleep_millisecs = val;
+    }
+    return count;
+}
+
+static struct kobj_attribute files_queued_attr = __ATTR_RO(files_queued);
+static struct kobj_attribute pages_deduped_attr = __ATTR_RO(pages_deduped);
+static struct kobj_attribute pages_scanned_attr = __ATTR_RO(pages_scanned);
+static struct kobj_attribute sleep_millisecs_attr = __ATTR_RW(sleep_millisecs);
+
+static struct attribute *oob_dedup_attrs[] = {
+    &files_queued_attr.attr,
+    &pages_deduped_attr.attr,
+    &pages_scanned_attr.attr,
+    &sleep_millisecs_attr.attr,
+    NULL,
+};
+ATTRIBUTE_GROUPS(oob_dedup); 
+
 static int __init oob_dedup_init(void)
 {
 	printk(KERN_EMERG "OOB_DEDUP: Entering init function...\n");
@@ -276,26 +331,43 @@ static int __init oob_dedup_init(void)
 	hash_init(oob_folio_hash);
 
 	file_dedup_cache = kmem_cache_create("file_dedup_slot",
-					sizeof(struct file_dedup_slot),
-					0, SLAB_PANIC, NULL);
-	if (!file_dedup_cache){
-		printk(KERN_EMERG "OOB_DEDUP: Cache creation failed!\n");
-		return -ENOMEM;
-	}
+                    sizeof(struct file_dedup_slot),
+                    0, SLAB_PANIC, NULL);
+    if (!file_dedup_cache){
+        printk(KERN_EMERG "OOB_DEDUP: Cache creation failed!\n");
+        return -ENOMEM;
+    }
 
-	oob_dedup_thread = kthread_run(oob_dedup_thread_fn, NULL, "oob_dedupd");
-	if (IS_ERR(oob_dedup_thread)) {
-		err = PTR_ERR(oob_dedup_thread);
-		printk(KERN_EMERG "OOB_DEDUP: kthread_run failed with err: %d\n", err);
-		goto out_free_cache;
-	}
+    oob_dedup_kobj = kobject_create_and_add("oob_dedup", kernel_kobj);
+    if (!oob_dedup_kobj) {
+        printk(KERN_EMERG "OOB_DEDUP: Failed to create sysfs kobject\n");
+        err = -ENOMEM;
+        goto out_free_cache;
+    }
 
-	printk(KERN_EMERG "OOB_DEDUP: Initialization complete, thread running.\n");
-	return 0;
+    err = sysfs_create_groups(oob_dedup_kobj, oob_dedup_groups);
+    if (err) {
+        printk(KERN_EMERG "OOB_DEDUP: Failed to create sysfs groups\n");
+        goto out_put_kobj;
+    }
 
+    oob_dedup_thread = kthread_run(oob_dedup_thread_fn, NULL, "oob_dedupd");
+    if (IS_ERR(oob_dedup_thread)) {
+        err = PTR_ERR(oob_dedup_thread);
+        printk(KERN_EMERG "OOB_DEDUP: kthread_run failed with err: %d\n", err);
+        goto out_remove_groups;
+    }
+
+    printk(KERN_INFO "OOB_DEDUP: Initialization complete, thread running.\n");
+    return 0;
+
+out_remove_groups:
+    sysfs_remove_groups(oob_dedup_kobj, oob_dedup_groups);
+out_put_kobj:
+    kobject_put(oob_dedup_kobj);
 out_free_cache:
-	kmem_cache_destroy(file_dedup_cache);
-	return err;
+    kmem_cache_destroy(file_dedup_cache);
+    return err;
 }
 
 void oob_dedup_wakeup(void) {
@@ -316,6 +388,7 @@ int oob_dedup_add_file(struct address_space *mapping)
         if (slot) {
             file_dedup_slot_insert(file_dedup_hash, mapping, slot);
             list_add_tail(&slot->list, &file_dedup_list);
+            atomic_inc(&stat_files_queued);
         // ihold(mapping->host);
 			pr_info("OOB_DEDUP: Queued file for dedup. Inode: %lu, Mapping: %p\n",mapping->host->i_ino, mapping);
             oob_dedup_wakeup();
@@ -355,6 +428,7 @@ int oob_dedup_evict_inode(struct inode *inode)
             }
 
             list_del(&slot->list);
+            atomic_dec(&stat_files_queued);
             hash_del(&slot->hash);
             file_dedup_slot_free(file_dedup_cache, slot);
             found_in_file_hash = true;
