@@ -24,6 +24,9 @@ static DEFINE_SPINLOCK(folio_hash_lock);
 static struct task_struct *oob_dedup_thread;
 static DECLARE_WAIT_QUEUE_HEAD(oob_dedup_wait);
 
+static struct kmem_cache *rmap_entry_cache;
+static struct kmem_cache *dedup_info_cache;
+
 static unsigned int sleep_millisecs = 20;
 static unsigned int pages_to_scan = 100;
 #define MAX_PAGES_PER_FILE 1024
@@ -60,6 +63,43 @@ struct page_entry {
     pgoff_t index;
     struct hlist_node node;
 };
+
+/*
+ * structures to maintain a symmetric deduped folio
+ * so that all other operations become easier 
+ */
+struct oob_dedup_info {
+    spinlock_t lock;
+    struct list_head rmap_list;
+    unsigned int rmap_count;
+    struct hlist_node node;
+}__attribute__((aligned(8)));
+
+struct oob_dedup_rmap_entry {
+    struct address_space* mapping;
+    pgoff_t index;
+    struct list_head list;
+};
+
+// function to check if the folio has been deduplicated
+static inline bool folio_test_dedup(struct folio *folio)
+{
+    return ((unsigned long)folio->mapping & PAGE_MAPPING_FLAGS) == PAGE_MAPPING_DEDUP;
+}
+
+// function to clean the bits on the mapping pointer and cast it to a oob_dedup_info struct
+static inline struct oob_dedup_info *folio_dedup_info(struct folio *folio)
+{
+    if (!folio_test_dedup(folio))
+        return NULL;
+    return (struct oob_dedup_info *)((unsigned long)folio->mapping & ~PAGE_MAPPING_FLAGS);
+}
+
+// set a newly created oob_dedup_info pointer to a folio->mapping pointer after setting the special bit 
+static inline void folio_set_dedup_info(struct folio *folio, struct oob_dedup_info *info)
+{
+    folio->mapping = (struct address_space *)((unsigned long)info | PAGE_MAPPING_DEDUP);
+}
 
 static u32 hash_folio(struct folio *folio)
 {
@@ -107,36 +147,120 @@ static void clean_folio_hashtable(void)
 static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
                               struct address_space *mapping, pgoff_t index)
 {
+    struct oob_dedup_info *info = NULL, *new_info = NULL;
+    struct oob_dedup_rmap_entry *orig_entry = NULL, *dup_entry = NULL;
     XA_STATE(xas, &mapping->i_pages, index);
-    int err = 0;
+    int err = -ENOMEM;
 
-    folio_lock(dup_folio);
+    // preallocate the entries and the info struct before taking
+    // the locks to avoid a pretty stupid deadlock
+    dup_entry = kmem_cache_alloc(rmap_entry_cache, GFP_KERNEL);
+    if (!dup_entry) return -ENOMEM;
 
-    if (folio_mapping(dup_folio) != mapping || folio_index(dup_folio) != index) {
-        pr_debug("Folio changed before removal. Aborting.\n");
-        err = -EAGAIN;
-        goto out;
+    if (!folio_test_dedup(orig_folio)) {
+        new_info = kmem_cache_alloc(dedup_info_cache, GFP_KERNEL);
+        orig_entry = kmem_cache_alloc(rmap_entry_cache, GFP_KERNEL);
+        if (!new_info || !orig_entry) goto out_free;
     }
 
-    /* Increase reference count of original folio*/
+    // aquire locks for the folios
+    if (orig_folio < dup_folio) {
+        folio_lock(orig_folio);
+        folio_lock(dup_folio);
+    } else {
+        folio_lock(dup_folio);
+        folio_lock(orig_folio);
+    }
+    
+    /*
+     * MUahahaha
+     * checks to only have very clean folios deduplicated
+     * no folios in write backs 
+     * no folios in reads 
+     * and no dirty folios 
+     * */
+    if (!folio_test_uptodate(orig_folio) || !folio_test_uptodate(dup_folio) ||
+        folio_test_dirty(orig_folio) || folio_test_dirty(dup_folio) ||
+        folio_test_writeback(orig_folio) || folio_test_writeback(dup_folio) ||
+        folio_mapped(orig_folio) || folio_mapped(dup_folio)) {
+        err = -EBUSY;
+        goto out_unlock;
+    }
+
+    // a check to make sure that the dup_folio was not changed before deduplication 
+    if (folio_mapping(dup_folio) != mapping || folio_index(dup_folio) != index ||
+        !folio_mapping(orig_folio)) {
+        err = -EAGAIN;
+        goto out_unlock;
+    }
+
+    /*
+     * setting up a new oob_dedup_info if the orig_folio is not already deduplicated
+     * and also populating it with the entry
+     * else we just extract the info struct 
+     * */
+    if (!folio_test_dedup(orig_folio)) {
+        info = new_info;
+        spin_lock_init(&info->lock);
+        INIT_LIST_HEAD(&info->rmap_list);
+        
+        orig_entry->mapping = orig_folio->mapping;
+        orig_entry->index = orig_folio->index;
+        list_add(&orig_entry->list, &info->rmap_list);
+        info->rmap_count = 1;
+        
+        folio_set_dedup_info(orig_folio, info);
+        new_info = NULL; /* Consumed */
+        orig_entry = NULL; 
+    } else {
+        info = folio_dedup_info(orig_folio);
+    }
+
+    // add the dup_entry to our info from the orig_folio
+    dup_entry->mapping = mapping;
+    dup_entry->index = index;
+    spin_lock(&info->lock);
+    list_add_tail(&dup_entry->list, &info->rmap_list);
+    info->rmap_count++;
+    spin_unlock(&info->lock);
+
+    // setup the xarray of the dup_folio(its inode)
     folio_get(orig_folio);
+    xas_lock_irq(&xas);
     xas_store(&xas, orig_folio);
+    if (xas_error(&xas)) {
+        // xas_store failed
+        xas_unlock_irq(&xas);
+        folio_put(orig_folio);
+        spin_lock(&info->lock);
+        list_del(&dup_entry->list);
+        info->rmap_count--;
+        spin_unlock(&info->lock);
+        err = xas_error(&xas);
+        goto out_unlock;
+    }
+    xas_unlock_irq(&xas);
 
-    /* Decrease reference count to duplicate folio */
+    // orphan the dup_folio
     dup_folio->mapping = NULL;
-    dup_folio->index=0;
-    // folio_put(dup_folio);
-    atomic_inc(&stat_pages_deduped);
-    pr_info("Successfully MERGED duplicate folio at index %lu\n", index);
+    dup_folio->index = 0;
 
-out:
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
-
-    if(!err){
     folio_put(dup_folio);
-    }
+
+    atomic_inc(&stat_pages_deduped);
+    return 0;
+
+out_unlock:
+    folio_unlock(dup_folio);
+    folio_unlock(orig_folio);
+out_free:
+    if (new_info) kmem_cache_free(dedup_info_cache, new_info);
+    if (orig_entry) kmem_cache_free(rmap_entry_cache, orig_entry);
+    if (dup_entry) kmem_cache_free(rmap_entry_cache, dup_entry);
     return err;
+
 }
 
 static void check_and_store_folio(struct folio *folio, struct address_space *mapping, pgoff_t index)
@@ -338,6 +462,19 @@ static int __init oob_dedup_init(void)
         return -ENOMEM;
     }
 
+    // peer entry cache
+    rmap_entry_cache = kmem_cache_create("oob_dedup_rmap_entry",
+                        sizeof(struct oob_dedup_rmap_entry),
+                        0, SLAB_PANIC, NULL);
+
+    // info struct cache (byte aligned)
+    dedup_info_cache = kmem_cache_create("oob_dedup_info",
+                        sizeof(struct oob_dedup_info),
+                        8, SLAB_PANIC, NULL);
+
+    if (!rmap_entry_cache || !dedup_info_cache)
+        return -ENOMEM;
+
     oob_dedup_kobj = kobject_create_and_add("oob_dedup", kernel_kobj);
     if (!oob_dedup_kobj) {
         printk(KERN_EMERG "OOB_DEDUP: Failed to create sysfs kobject\n");
@@ -412,6 +549,8 @@ int oob_dedup_evict_inode(struct inode *inode)
     bool found_in_file_hash = false;
     struct file_dedup_slot *slot;
     struct address_space *mapping = inode->i_mapping;
+    struct folio* folio;
+    XA_STATE(xas, &mapping->i_pages, 0);
 
     spin_lock(&file_dedup_lock);
 
@@ -445,84 +584,59 @@ int oob_dedup_evict_inode(struct inode *inode)
         }
     }
     spin_unlock(&folio_hash_lock);
+ 
+    if (!mapping) return 0;
 
-    
+    /* clean up deduped folios and handle dissolution */
+    xas_lock_irq(&xas);
+    xas_for_each(&xas, folio, ULONG_MAX) {
+        if (xas_retry(&xas, folio)) continue;
+        if (!folio_test_dedup(folio)) continue;
 
-    if (mapping) {
-        struct folio *clones[16];
-        int count;
+        // lock the folio first to safely change its identity lest we might result in deadlock
+        if (!folio_trylock(folio)) {
+            continue; 
+        }
+
+        struct oob_dedup_info *info = folio_dedup_info(folio);
+        struct oob_dedup_rmap_entry *entry, *tmp_entry;
+        bool dissolve = false;
+
+        spin_lock(&info->lock);
+        list_for_each_entry_safe(entry, tmp_entry, &info->rmap_list, list) {
+            if (entry->mapping == mapping) {
+                list_del(&entry->list);
+                info->rmap_count--;
+                kmem_cache_free(rmap_entry_cache, entry);
+            }
+        }
+
+        // if after removal of the peer we are left with only one entry
+        // we just reinstantiate it as a proper folio 
+        if (info->rmap_count == 1) {
+            struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
+                                               struct oob_dedup_rmap_entry, list);
+            
+            folio->mapping = last->mapping;
+            folio->index = last->index;
+            
+            list_del(&last->list);
+            kmem_cache_free(rmap_entry_cache, last);
+            dissolve = true; 
+        }
         
-        do {
-            struct folio *f;
-            // Start from index 0 on each batch to safely catch remaining clones 
-            XA_STATE(xas, &mapping->i_pages, 0); 
-            count = 0;
-            
-            xas_lock_irq(&xas);
-            xas_for_each(&xas, f, ULONG_MAX) {
-                if (xas_retry(&xas, f)) continue;
-
-                // If it's a clone (wrong mapping or index), queue it for execution 
-                if (f->mapping != mapping || f->index != xas.xa_index) {
-                    
-                    xas_store(&xas, NULL); 
-                    mapping->nrpages--;                        
-                    clones[count++] = f;
-                    if (count == 16) break;
-                }
-            }
-            xas_unlock_irq(&xas);
-
-            for (int i = 0; i < count; i++) {
-                folio_put(clones[i]); 
-            }
-            
-        } while (count > 0); 
-    }
-
-    if (found_in_hash) {
-        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
-    }
-
-    if (mapping) {
-        struct folio *clones[16];
-        int count;
+        spin_unlock(&info->lock);
         
-        do {
-            struct folio *f;
-            /* Start from index 0 on each batch to safely catch remaining clones */
-            XA_STATE(xas, &mapping->i_pages, 0); 
-            count = 0;
-            
-            xas_lock_irq(&xas);
-            xas_for_each(&xas, f, ULONG_MAX) {
-                if (xas_retry(&xas, f)) continue;
+        if (dissolve) {
+            kmem_cache_free(dedup_info_cache, info);
+        }
 
-                if (f->mapping != mapping || f->index != xas.xa_index) {
-                    
-                    xas_store(&xas, NULL); /* Wipe it from the tree */
-                    mapping->nrpages--;    /* 🚨 CRUCIAL: Tell VFS the page is gone! */
-                    
-                    clones[count++] = f;
-                    if (count == 16) break; /* Stop if our safe batch array is full */
-                }
-            }
-            xas_unlock_irq(&xas);
-
-            /* Safely drop all references outside the spinlock */
-            for (int i = 0; i < count; i++) {
-                folio_put(clones[i]); 
-            }
-            
-        } while (count > 0); /* Repeat until the tree is perfectly clean */
+        folio_unlock(folio);
     }
-
-    if (found_in_hash) {
-        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
-    }
-
-   // if (found_in_file_hash) {
-     //   iput(inode);
+    xas_unlock_irq(&xas);
+       
+    // if (found_in_file_hash) {
+    //   iput(inode);
     //}
 
     if (found_in_hash) {

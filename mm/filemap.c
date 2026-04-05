@@ -1911,7 +1911,9 @@ repeat:
 		}
 
 		/* Has the page been truncated? */
-		if (unlikely(folio->mapping != mapping)) {
+		// pr_info("filemap_get_folio was called\n");
+    if (unlikely(folio->mapping != mapping)) {
+      // pr_info("__filemap_get_folio was called here and returned with error\n");
 			folio_unlock(folio);
 			folio_put(folio);
 			goto repeat;
@@ -2380,9 +2382,11 @@ static void filemap_get_read_batch(struct address_space *mapping,
 			break;
 		if (!folio_try_get(folio))
 			goto retry;
-
-		if (unlikely(folio != xas_reload(&xas)))
+    //pr_info("filemap_get_read_batch was called");
+		if (unlikely(folio != xas_reload(&xas))){
+      //pr_info("filemap_get_read_batch was called and issued an error");
 			goto put_folio;
+    }
 
 		if (!folio_batch_add(fbatch, folio))
 			break;
