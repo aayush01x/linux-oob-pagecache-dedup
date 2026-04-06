@@ -232,10 +232,25 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         // xas_store failed
         xas_unlock_irq(&xas);
         folio_put(orig_folio);
+        
         spin_lock(&info->lock);
         list_del(&dup_entry->list);
         info->rmap_count--;
+        
+        
+        //if the orig_folio wasn't deduplicated before
+        // need to return mapping to normal and free info and other struct
+        bool dissolve_needed = (info->rmap_count == 1);
         spin_unlock(&info->lock);
+        
+        if (dissolve_needed){
+			orig_folio->mapping = orig_entry->mapping;
+			orig_folio->index = orig_entry->index;
+			
+			kmem_cache_free(rmap_entry_cache, orig_entry);
+			kmem_cache_free(dedup_info_cache, info);
+		}
+        
         err = xas_error(&xas);
         goto out_unlock;
     }
@@ -650,3 +665,7 @@ EXPORT_SYMBOL_GPL(oob_dedup_add_file);
 EXPORT_SYMBOL_GPL(oob_dedup_evict_inode);
 
 subsys_initcall(oob_dedup_init);
+
+#ifdef CONFIG_KUNIT
+#include "tests/test_functionality.c"
+#endif
