@@ -418,6 +418,45 @@ static int oob_dedup_thread_fn(void *nothing)
 	return 0;
 }
 
+/* 
+ * in case the kernel decides that the folio is not need in the page cache
+ * the folio is removed from the page cahce 
+ * hence we handle it here
+ * see page_cache_delete in mm/filemap.c for more info 
+ *
+ * */
+void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping)
+{
+    struct oob_dedup_info *info = folio_dedup_info(folio);
+    struct oob_dedup_rmap_entry *entry, *tmp;
+    bool dissolve = false;
+
+    spin_lock(&info->lock);
+    list_for_each_entry_safe(entry, tmp, &info->rmap_list, list) {
+        if (entry->mapping == mapping) {
+            list_del(&entry->list);
+            info->rmap_count--;
+            kmem_cache_free(rmap_entry_cache, entry);
+            break; 
+        }
+    }
+
+    // last page remaining 
+    if (info->rmap_count == 1) {
+        struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
+                                           struct oob_dedup_rmap_entry, list);
+        folio->mapping = last->mapping;
+        folio->index = last->index;
+        list_del(&last->list);
+        kmem_cache_free(rmap_entry_cache, last);
+        dissolve = true;
+    }
+    spin_unlock(&info->lock);
+
+    if (dissolve)
+        kmem_cache_free(dedup_info_cache, info);
+}
+
 /* sysfs attribute functions */
 static ssize_t files_queued_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {

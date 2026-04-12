@@ -48,6 +48,7 @@
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
+#include "oob_dedup.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/filemap.h>
@@ -126,14 +127,15 @@
 static void page_cache_delete(struct address_space *mapping,
 				   struct folio *folio, void *shadow)
 {
-	XA_STATE(xas, &mapping->i_pages, folio->index);
+  pgoff_t f_index = folio_index_in(folio, mapping);
+  XA_STATE(xas, &mapping->i_pages, f_index);
 	long nr = 1;
 
 	mapping_set_update(&xas, mapping);
 
 	/* hugetlb pages are represented by a single entry in the xarray */
 	if (!folio_test_hugetlb(folio)) {
-		xas_set_order(&xas, folio->index, folio_order(folio));
+		xas_set_order(&xas, f_index, folio_order(folio));
 		nr = folio_nr_pages(folio);
 	}
 
@@ -142,7 +144,11 @@ static void page_cache_delete(struct address_space *mapping,
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
 
-	folio->mapping = NULL;
+	if (folio_test_dedup(folio)) {
+    oob_dedup_disconnect_folio(folio, mapping);
+  } else {
+    folio->mapping = NULL;
+  }
 	/* Leave page->index set: truncation lookup relies upon it */
 	mapping->nrpages -= nr;
 }
@@ -1912,7 +1918,7 @@ repeat:
 
 		/* Has the page been truncated? */
 		// pr_info("filemap_get_folio was called\n");
-    if (unlikely(folio->mapping != mapping)) {
+    if (unlikely(!folio_shares_mapping(folio,mapping))) {
       // pr_info("__filemap_get_folio was called here and returned with error\n");
 			folio_unlock(folio);
 			folio_put(folio);
@@ -2115,17 +2121,28 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, XA_PRESENT))) {
 		if (!xa_is_value(folio)) {
+      /*
 			if (folio->index < *start)
 				goto put;
 			if (folio_next_index(folio) - 1 > end)
 				goto put;
+      */
+      // new check to not break stuff actually.
+      pgoff_t f_index = folio_index_in(folio, mapping);
+
+      if (f_index < *start)
+        goto put;
+      if (f_index + folio_nr_pages(folio) - 1 > end)
+        goto put;
+
 			if (!folio_trylock(folio))
 				goto put;
-			if (folio->mapping != mapping ||
+			if (!folio_shares_mapping(folio,mapping) ||
 			    folio_test_writeback(folio))
 				goto unlock;
-			VM_BUG_ON_FOLIO(!folio_contains(folio, xas.xa_index),
-					folio);
+			// VM_BUG_ON_FOLIO(!folio_contains(folio, xas.xa_index),
+					// folio);
+      VM_BUG_ON_FOLIO((xas.xa_index - f_index) >= folio_nr_pages(folio), folio);
 		}
 		indices[fbatch->nr] = xas.xa_index;
 		if (!folio_batch_add(fbatch, folio))
@@ -2187,7 +2204,12 @@ unsigned filemap_get_folios(struct address_space *mapping, pgoff_t *start,
 
 			if (folio_test_hugetlb(folio))
 				nr = 1;
-			*start = folio->index + nr;
+//			*start = folio->index + nr;
+//#ifdef CONFIG_OOB_DEDUP
+      *start = folio_index_in(folio, mapping) + nr;
+//#else
+  //    *start = folio->index + nr;
+//#endif
 			goto out;
 		}
 	}
@@ -2566,12 +2588,17 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 		struct address_space *mapping, struct folio *folio,
 		pgoff_t last_index)
 {
-	DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, folio->index);
+	// DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, folio->index);
+  // again for the index wala change
+  pgoff_t f_index = folio_index_in(folio, mapping);
+  DEFINE_READAHEAD(ractl, file, &file->f_ra, mapping, f_index);
+	
 
-	if (iocb->ki_flags & IOCB_NOIO)
+  if (iocb->ki_flags & IOCB_NOIO)
 		return -EAGAIN;
-	page_cache_async_ra(&ractl, folio, last_index - folio->index);
-	return 0;
+	//page_cache_async_ra(&ractl, folio, last_index - folio->index);
+	page_cache_async_ra(&ractl, folio, last_index - f_index);
+  return 0;
 }
 
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
@@ -3503,7 +3530,7 @@ static struct folio *next_uptodate_folio(struct xa_state *xas,
 			goto skip;
 		if (!folio_trylock(folio))
 			goto skip;
-		if (folio->mapping != mapping)
+		if (!folio_shares_mapping(folio,mapping))
 			goto unlock;
 		if (!folio_test_uptodate(folio))
 			goto unlock;
