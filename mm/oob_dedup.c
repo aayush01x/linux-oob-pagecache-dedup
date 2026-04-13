@@ -14,6 +14,7 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
+#include "oob_dedup.h"
 
 /* Global Queue and Thread Data */
 static LIST_HEAD(file_dedup_list);
@@ -38,12 +39,7 @@ static atomic_t stat_files_queued = ATOMIC_INIT(0);
 static atomic_t stat_pages_deduped = ATOMIC_INIT(0);
 static atomic_t stat_pages_scanned = ATOMIC_INIT(0);
 
-/* struct oob_scan - cursor for scanning */
-struct oob_scan {
-    struct file_dedup_slot *slot;
-    unsigned long pgoff;   
-    unsigned long seqnr;
-};
+
 
 static struct oob_scan oob_scan = {
     .slot = NULL,
@@ -53,53 +49,9 @@ static struct oob_scan oob_scan = {
 
 static DEFINE_HASHTABLE(oob_folio_hash, 12);
 
-/*
-* store mapping and index instead of raw PFN
-* to check if some page still exists in cache or is evicted.
-*/
-struct page_entry {
-    u32 hash;
-    struct address_space *mapping;
-    pgoff_t index;
-    struct hlist_node node;
-};
 
-/*
- * structures to maintain a symmetric deduped folio
- * so that all other operations become easier 
- */
-struct oob_dedup_info {
-    spinlock_t lock;
-    struct list_head rmap_list;
-    unsigned int rmap_count;
-    struct hlist_node node;
-}__attribute__((aligned(8)));
 
-struct oob_dedup_rmap_entry {
-    struct address_space* mapping;
-    pgoff_t index;
-    struct list_head list;
-};
 
-// function to check if the folio has been deduplicated
-static inline bool folio_test_dedup(struct folio *folio)
-{
-    return ((unsigned long)folio->mapping & PAGE_MAPPING_FLAGS) == PAGE_MAPPING_DEDUP;
-}
-
-// function to clean the bits on the mapping pointer and cast it to a oob_dedup_info struct
-static inline struct oob_dedup_info *folio_dedup_info(struct folio *folio)
-{
-    if (!folio_test_dedup(folio))
-        return NULL;
-    return (struct oob_dedup_info *)((unsigned long)folio->mapping & ~PAGE_MAPPING_FLAGS);
-}
-
-// set a newly created oob_dedup_info pointer to a folio->mapping pointer after setting the special bit 
-static inline void folio_set_dedup_info(struct folio *folio, struct oob_dedup_info *info)
-{
-    folio->mapping = (struct address_space *)((unsigned long)info | PAGE_MAPPING_DEDUP);
-}
 
 static u32 hash_folio(struct folio *folio)
 {
