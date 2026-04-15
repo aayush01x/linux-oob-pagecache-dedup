@@ -22,6 +22,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include "internal.h"
+#include "oob_dedup.h"
 
 /*
  * Regular page slots are stabilized by the page lock even without the tree
@@ -171,6 +172,7 @@ EXPORT_SYMBOL_GPL(folio_invalidate);
  */
 static void truncate_cleanup_folio(struct folio *folio)
 {
+
 	if (folio_mapped(folio))
 		unmap_mapping_folio(folio);
 
@@ -388,8 +390,9 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
 		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
-		for (i = 0; i < folio_batch_count(&fbatch); i++)
-			truncate_cleanup_folio(fbatch.folios[i]);
+		for (i = 0; i < folio_batch_count(&fbatch); i++){
+
+			truncate_cleanup_folio(fbatch.folios[i]);}
 		delete_from_page_cache_batch(mapping, &fbatch);
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
 			folio_unlock(fbatch.folios[i]);

@@ -382,8 +382,10 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
     struct oob_dedup_info *info = folio_dedup_info(folio);
     struct oob_dedup_rmap_entry *entry, *tmp;
     bool dissolve = false;
+	unsigned long flags;
 
-    spin_lock(&info->lock);
+// since the ancestor? function holds irqsave(non interruptible lock) we need to keep using irqsave locks
+    spin_lock_irqsave(&info->lock, flags);
     list_for_each_entry_safe(entry, tmp, &info->rmap_list, list) {
         if (entry->mapping == mapping) {
             list_del(&entry->list);
@@ -403,10 +405,11 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
     }
-    spin_unlock(&info->lock);
-
-    if (dissolve)
+	spin_unlock_irqrestore(&info->lock, flags);
+    if (dissolve){
         kmem_cache_free(dedup_info_cache, info);
+   
+        }
 }
 
 /* sysfs attribute functions */
@@ -544,10 +547,10 @@ int oob_dedup_add_file(struct address_space *mapping)
     spin_unlock(&file_dedup_lock);
     return err;
 }
-
-
 int oob_dedup_evict_inode(struct inode *inode)
 {
+	pr_debug("OOB_DEDUP: ENTERING EVICT NODE FUCTION\n");
+	dump_stack();
     struct page_entry *entry;
     struct hlist_node *tmp;
     int bkt;
@@ -650,6 +653,7 @@ int oob_dedup_evict_inode(struct inode *inode)
     }
     return 0;
 }
+
 
 EXPORT_SYMBOL_GPL(oob_dedup_add_file);
 // EXPORT_SYMBOL_GPL(oob_dedup_remove_file);
