@@ -379,12 +379,12 @@ static int oob_dedup_thread_fn(void *nothing)
  * */
 void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping)
 {
-    struct oob_dedup_info *info = folio_dedup_info(folio);
-    struct oob_dedup_rmap_entry *entry, *tmp;
-    bool dissolve = false;
+  struct oob_dedup_info *info = folio_dedup_info(folio);
+  struct oob_dedup_rmap_entry *entry, *tmp;
+  bool dissolve = false;
 	unsigned long flags;
 
-// since the ancestor? function holds irqsave(non interruptible lock) we need to keep using irqsave locks
+    // since the ancestor? function holds irqsave(non interruptible lock) we need to keep using irqsave locks
     spin_lock_irqsave(&info->lock, flags);
     list_for_each_entry_safe(entry, tmp, &info->rmap_list, list) {
         if (entry->mapping == mapping) {
@@ -547,25 +547,128 @@ int oob_dedup_add_file(struct address_space *mapping)
     spin_unlock(&file_dedup_lock);
     return err;
 }
+// int oob_dedup_evict_inode(struct inode *inode)
+// {
+// 	pr_debug("OOB_DEDUP: ENTERING EVICT NODE FUCTION\n");
+// 	dump_stack();
+//     struct page_entry *entry;
+//     struct hlist_node *tmp;
+//     int bkt;
+//     bool found_in_hash = false;
+//     bool found_in_file_hash = false;
+//     struct file_dedup_slot *slot;
+//     struct address_space *mapping = inode->i_mapping;
+//     struct folio* folio;
+//     XA_STATE(xas, &mapping->i_pages, 0);
+//
+//     spin_lock(&file_dedup_lock);
+//
+//     if (mapping) {
+//         slot = file_dedup_slot_lookup(file_dedup_hash, inode->i_mapping);
+//         if (slot) {
+//             if (oob_scan.slot == slot) {
+//                 struct file_dedup_slot *next = list_next_entry(slot, list);
+//                 if (list_is_head(&next->list, &file_dedup_list))
+//                     oob_scan.slot = NULL;
+//                 else
+//                     oob_scan.slot = next;
+//                 oob_scan.pgoff = 0;
+//             }
+//
+//             list_del(&slot->list);
+//             atomic_dec(&stat_files_queued);
+//             hash_del(&slot->hash);
+//             file_dedup_slot_free(file_dedup_cache, slot);
+//             found_in_file_hash = true;
+//         }
+//     }
+//     spin_unlock(&file_dedup_lock);
+//
+//     spin_lock(&folio_hash_lock);
+//     hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
+//         if (entry->mapping && entry->mapping->host == inode) {
+//             hash_del(&entry->node);
+//             kfree(entry);
+//             found_in_hash = true;
+//         }
+//     }
+//     spin_unlock(&folio_hash_lock);
+//
+//     if (!mapping) return 0;
+//
+//     /* clean up deduped folios and handle dissolution */
+//     xas_lock_irq(&xas);
+//     xas_for_each(&xas, folio, ULONG_MAX) {
+//         if (xas_retry(&xas, folio)) continue;
+//         if (!folio_test_dedup(folio)) continue;
+//
+//         // lock the folio first to safely change its identity lest we might result in deadlock
+//         if (!folio_trylock(folio)) {
+//             continue; 
+//         }
+//
+//         struct oob_dedup_info *info = folio_dedup_info(folio);
+//         struct oob_dedup_rmap_entry *entry, *tmp_entry;
+//         bool dissolve = false;
+//
+//         spin_lock(&info->lock);
+//         list_for_each_entry_safe(entry, tmp_entry, &info->rmap_list, list) {
+//             if (entry->mapping == mapping) {
+//                 list_del(&entry->list);
+//                 info->rmap_count--;
+//                 kmem_cache_free(rmap_entry_cache, entry);
+//             }
+//         }
+//
+//         // if after removal of the peer we are left with only one entry
+//         // we just reinstantiate it as a proper folio 
+//         if (info->rmap_count == 1) {
+//             struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
+//                                                struct oob_dedup_rmap_entry, list);
+//
+//             folio->mapping = last->mapping;
+//             folio->index = last->index;
+//
+//             list_del(&last->list);
+//             kmem_cache_free(rmap_entry_cache, last);
+//             dissolve = true; 
+//         }
+//
+//         spin_unlock(&info->lock);
+//
+//         if (dissolve) {
+//             kmem_cache_free(dedup_info_cache, info);
+//         }
+//
+//         folio_unlock(folio);
+//     }
+//     xas_unlock_irq(&xas);
+//
+//     // if (found_in_file_hash) {
+//     //   iput(inode);
+//     //}
+//
+//     // if (found_in_hash) {
+//     //     pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
+//     // }
+//     return 0;
+// }
+
 int oob_dedup_evict_inode(struct inode *inode)
 {
-	pr_debug("OOB_DEDUP: ENTERING EVICT NODE FUCTION\n");
-	dump_stack();
+    pr_debug("OOB_DEDUP: ENTERING EVICT NODE FUCTION\n");
+    struct address_space *mapping = inode->i_mapping;
+    struct file_dedup_slot *slot;
     struct page_entry *entry;
     struct hlist_node *tmp;
     int bkt;
-    bool found_in_hash = false;
-    bool found_in_file_hash = false;
-    struct file_dedup_slot *slot;
-    struct address_space *mapping = inode->i_mapping;
-    struct folio* folio;
-    XA_STATE(xas, &mapping->i_pages, 0);
 
+    /* we only clean the scan queue */
     spin_lock(&file_dedup_lock);
-
     if (mapping) {
-        slot = file_dedup_slot_lookup(file_dedup_hash, inode->i_mapping);
+        slot = file_dedup_slot_lookup(file_dedup_hash, mapping);
         if (slot) {
+            /* handle the case if we are scanning the file itself */
             if (oob_scan.slot == slot) {
                 struct file_dedup_slot *next = list_next_entry(slot, list);
                 if (list_is_head(&next->list, &file_dedup_list))
@@ -576,81 +679,24 @@ int oob_dedup_evict_inode(struct inode *inode)
             }
 
             list_del(&slot->list);
-            atomic_dec(&stat_files_queued);
             hash_del(&slot->hash);
+            atomic_dec(&stat_files_queued);
             file_dedup_slot_free(file_dedup_cache, slot);
-            found_in_file_hash = true;
         }
     }
     spin_unlock(&file_dedup_lock);
 
+    /* remove the folio from the hash */
     spin_lock(&folio_hash_lock);
     hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
-        if (entry->mapping && entry->mapping->host == inode) {
+        if (entry->mapping == mapping) {
             hash_del(&entry->node);
             kfree(entry);
-            found_in_hash = true;
         }
     }
     spin_unlock(&folio_hash_lock);
- 
-    if (!mapping) return 0;
 
-    /* clean up deduped folios and handle dissolution */
-    xas_lock_irq(&xas);
-    xas_for_each(&xas, folio, ULONG_MAX) {
-        if (xas_retry(&xas, folio)) continue;
-        if (!folio_test_dedup(folio)) continue;
-
-        // lock the folio first to safely change its identity lest we might result in deadlock
-        if (!folio_trylock(folio)) {
-            continue; 
-        }
-
-        struct oob_dedup_info *info = folio_dedup_info(folio);
-        struct oob_dedup_rmap_entry *entry, *tmp_entry;
-        bool dissolve = false;
-
-        spin_lock(&info->lock);
-        list_for_each_entry_safe(entry, tmp_entry, &info->rmap_list, list) {
-            if (entry->mapping == mapping) {
-                list_del(&entry->list);
-                info->rmap_count--;
-                kmem_cache_free(rmap_entry_cache, entry);
-            }
-        }
-
-        // if after removal of the peer we are left with only one entry
-        // we just reinstantiate it as a proper folio 
-        if (info->rmap_count == 1) {
-            struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
-                                               struct oob_dedup_rmap_entry, list);
-            
-            folio->mapping = last->mapping;
-            folio->index = last->index;
-            
-            list_del(&last->list);
-            kmem_cache_free(rmap_entry_cache, last);
-            dissolve = true; 
-        }
-        
-        spin_unlock(&info->lock);
-        
-        if (dissolve) {
-            kmem_cache_free(dedup_info_cache, info);
-        }
-
-        folio_unlock(folio);
-    }
-    xas_unlock_irq(&xas);
-       
-    // if (found_in_file_hash) {
-    //   iput(inode);
-    //}
-
-    if (found_in_hash) {
-        pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
-    }
+    
     return 0;
 }
 

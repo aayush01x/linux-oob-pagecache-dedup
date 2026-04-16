@@ -285,7 +285,8 @@ void filemap_remove_folio(struct folio *folio)
 static void page_cache_delete_batch(struct address_space *mapping,
 			     struct folio_batch *fbatch)
 {
-	XA_STATE(xas, &mapping->i_pages, fbatch->folios[0]->index);
+	// XA_STATE(xas, &mapping->i_pages, fbatch->folios[0]->index);
+  XA_STATE(xas, &mapping->i_pages, folio_index_in(fbatch->folios[0], mapping));
 	long total_pages = 0;
 	int i = 0;
 	struct folio *folio;
@@ -306,14 +307,19 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		 * possible because we're holding the PageLock.
 		 */
 		if (folio != fbatch->folios[i]) {
-			VM_BUG_ON_FOLIO(folio->index >
-					fbatch->folios[i]->index, folio);
+			// VM_BUG_ON_FOLIO(folio->index >
+			// 		fbatch->folios[i]->index, folio);
+      VM_BUG_ON_FOLIO(folio_index_in(folio, mapping) >
+					folio_index_in(fbatch->folios[i], mapping), folio);
 			continue;
 		}
 
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
-		folio->mapping = NULL;
+		if (folio_test_dedup(folio))
+      oob_dedup_disconnect_folio(folio, mapping);
+    else
+      folio->mapping = NULL;
 		/* Leave folio->index set: truncation lookup relies on it */
 
 		i++;
