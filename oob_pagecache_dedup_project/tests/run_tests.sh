@@ -43,7 +43,7 @@ run_test() {
 
   sleep 1
 
-  sudo dmesg -C
+  # sudo dmesg -C
   sleep 1
 
   sudo ./$EXEC

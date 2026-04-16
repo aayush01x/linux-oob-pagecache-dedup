@@ -235,6 +235,7 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
     struct page_entry *entry;
     struct hlist_node *tmp;
     bool found = false;
+    int err;
     u32 hash = hash_folio(folio);
 
     spin_lock(&folio_hash_lock);
@@ -264,8 +265,12 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                 pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu)\n",
                          entry_mapping->host->i_ino, entry_index,
                          mapping->host->i_ino, index);
-                if (deduplicate_folio(orig_folio, folio, mapping, index) == 0) {
+                err = deduplicate_folio(orig_folio, folio, mapping, index);
+                if (err == 0) {
+                    pr_info("Folio deduped successfully\n");
                     found = true;
+                }else{
+                    pr_info("Could not deduplicate folio with err code = %d",err);
                 }
             }
             folio_put(orig_folio);
