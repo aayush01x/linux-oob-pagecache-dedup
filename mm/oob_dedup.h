@@ -123,3 +123,29 @@ static inline loff_t folio_pos_in(struct folio *folio, struct address_space *map
 }
 
 void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping);
+
+
+static inline loff_t folio_pos_near(struct folio *folio, 
+                                    struct address_space *mapping, 
+                                    pgoff_t target_index)
+{
+    if (likely(!folio_test_dedup(folio)))
+        return folio_pos(folio);
+
+    struct oob_dedup_info *info = folio_dedup_info(folio);
+    struct oob_dedup_rmap_entry *entry;
+    pgoff_t found_index = folio->index;
+
+    spin_lock(&info->lock);
+    list_for_each_entry(entry, &info->rmap_list, list) {
+        /* For intra-file, find the entry that contains the index we are currently truncating */
+        if (entry->mapping == mapping && 
+            target_index >= entry->index && 
+            target_index < entry->index + folio_nr_pages(folio)) {
+            found_index = entry->index;
+            break;
+        }
+    }
+    spin_unlock(&info->lock);
+    return (loff_t)found_index << PAGE_SHIFT;
+}

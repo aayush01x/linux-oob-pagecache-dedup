@@ -206,6 +206,9 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         err = xas_error(&xas);
         goto out_unlock;
     }
+    else{
+        mapping->nrpages--;
+    }
     xas_unlock_irq(&xas);
 
     // orphan the dup_folio

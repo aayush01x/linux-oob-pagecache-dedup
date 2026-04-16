@@ -227,6 +227,9 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	struct address_space *mapping = folio->mapping;
 
 	trace_mm_filemap_delete_from_page_cache(folio);
+	if (unlikely(folio_test_dedup(folio))) {
+		oob_dedup_disconnect_folio(folio, mapping);
+	}
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }
