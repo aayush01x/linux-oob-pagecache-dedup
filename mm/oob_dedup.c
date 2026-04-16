@@ -211,12 +211,19 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     }
     xas_unlock_irq(&xas);
 
+    __lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
+
+
     // orphan the dup_folio
     dup_folio->mapping = NULL;
     dup_folio->index = 0;
 
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
+
+    pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
+        folio_pfn(dup_folio),folio_ref_count(dup_folio));
+    folio_put(dup_folio);
     folio_put(dup_folio);
 
     atomic_inc(&stat_pages_deduped);
