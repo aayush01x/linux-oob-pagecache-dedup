@@ -38,7 +38,9 @@ static struct kobject *oob_dedup_kobj;
 static atomic_t stat_files_queued = ATOMIC_INIT(0);
 static atomic_t stat_pages_deduped = ATOMIC_INIT(0);
 static atomic_t stat_pages_scanned = ATOMIC_INIT(0);
+static atomic_t stat_folios_split = ATOMIC_INIT(0);
 
+static unsigned int merge_threshold_pct = 50;
 
 
 static struct oob_scan oob_scan = {
@@ -51,36 +53,44 @@ static DEFINE_HASHTABLE(oob_folio_hash, 12);
 
 
 
-
-
 static u32 hash_folio(struct folio *folio)
 {
-    void *addr;
-    u32 hash;
-    
-    addr = kmap_local_folio(folio, 0);
-    hash = crc32_le(~0, addr, PAGE_SIZE);
-    kunmap_local(addr);
-    
-    return hash;
+	void *addr;
+	u32 hash = ~0;
+	long i, nr = folio_nr_pages(folio);
+
+	for (i = 0; i < nr; i++) {
+		addr = kmap_local_folio(folio, i * PAGE_SIZE);
+		hash = crc32_le(hash, addr, PAGE_SIZE);
+		kunmap_local(addr);
+	}
+
+	return hash;
 }
 
-static bool compare_folios(struct folio *f1, struct folio *f2)
+static unsigned int compare_folios_count(struct folio *f1, struct folio *f2)
 {
-    void *addr1, *addr2;
-    bool match = false;
+	long nr = folio_nr_pages(f1);
+	unsigned int matched = 0;
+	long i;
 
-    addr1 = kmap_local_folio(f1, 0);
-    addr2 = kmap_local_folio(f2, 0);
-
-    if (memcmp(addr1, addr2, PAGE_SIZE) == 0)
-        match = true;
-
-    kunmap_local(addr2);
-    kunmap_local(addr1);
-
-    return match;
+	for (i = 0; i < nr; i++) {
+		void *a1 = kmap_local_folio(f1, i * PAGE_SIZE);
+		void *a2 = kmap_local_folio(f2, i * PAGE_SIZE);
+		if (memcmp(a1, a2, PAGE_SIZE) == 0)
+			matched++;
+		kunmap_local(a2);
+		kunmap_local(a1);
+	}
+	return matched;
 }
+
+// static bool compare_folios(struct folio *f1, struct folio *f2)
+// {
+// 	if (folio_nr_pages(f1) != folio_nr_pages(f2))
+// 		return false;
+// 	return compare_folios_count(f1, f2) == folio_nr_pages(f1);
+// }
 
 static void clean_folio_hashtable(void)
 {
@@ -139,13 +149,33 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         goto out_unlock;
     }
 
+    /*
+     * Strip any filesystem-specific private data (like XFS iomap_folio_state)
+     * from both folios before sharing, to prevent cross-inode state confusion.
+     */
+    if (folio_has_private(orig_folio)) {
+        if (!filemap_release_folio(orig_folio, GFP_KERNEL)) {
+            err = -EBUSY;
+            goto out_unlock;
+        }
+    }
+    if (folio_has_private(dup_folio)) {
+        if (!filemap_release_folio(dup_folio, GFP_KERNEL)) {
+            err = -EBUSY;
+            goto out_unlock;
+        }
+    }
+
     // a check to make sure that the dup_folio was not changed before deduplication 
-    if (folio_mapping(dup_folio) != mapping || folio_index(dup_folio) != index ||
-        !folio_mapping(orig_folio)) {
+    if (folio_mapping(dup_folio) != mapping || folio_index(dup_folio) != index) {
         err = -EAGAIN;
         goto out_unlock;
     }
-
+    
+    if (!folio_mapping(orig_folio)) {
+        err = -ESTALE;
+        goto out_unlock;
+    }
     /*
      * setting up a new oob_dedup_info if the orig_folio is not already deduplicated
      * and also populating it with the entry
@@ -206,12 +236,9 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         err = xas_error(&xas);
         goto out_unlock;
     }
-    else{
-        mapping->nrpages--;
-    }
     xas_unlock_irq(&xas);
 
-    __lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
+    lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
 
 
     // orphan the dup_folio
@@ -223,7 +250,6 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 
     pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
         folio_pfn(dup_folio),folio_ref_count(dup_folio));
-    folio_put(dup_folio);
     folio_put(dup_folio);
 
     atomic_inc(&stat_pages_deduped);
@@ -270,18 +296,41 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                 break;
             }
 
-            if (compare_folios(orig_folio, folio)) {
-                pr_info("Exact duplicate verified!\n");
-                pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu)\n",
-                         entry_mapping->host->i_ino, entry_index,
-                         mapping->host->i_ino, index);
-                err = deduplicate_folio(orig_folio, folio, mapping, index);
-                if (err == 0) {
-                    pr_info("Folio deduped successfully\n");
-                    found = true;
-                }else{
-                    pr_info("Could not deduplicate folio with err code = %d",err);
+            if (folio_order(orig_folio) == folio_order(folio)) {
+                long nr = folio_nr_pages(folio);
+                unsigned int matched = compare_folios_count(orig_folio, folio);
+
+                if (matched == nr) {
+                    pr_info("Exact duplicate verified!\n");
+                    pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu) | Order: %d\n",
+                             entry_mapping->host->i_ino, entry_index,
+                             mapping->host->i_ino, index, folio_order(folio));
+                    err = deduplicate_folio(orig_folio, folio, mapping, index);
+                    if (err == 0) {
+                        pr_info("Folio deduped successfully\n");
+                        found = true;
+                    } else {
+                        pr_info("Could not deduplicate folio with err code = %d", err);
+                    }
+                } else if (nr > 1 && matched * 100 >= nr * merge_threshold_pct) {
+                    pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
+                    folio_lock(folio);
+                    if (!split_folio(folio)) {
+                        atomic_inc(&stat_folios_split);
+                        pr_info("Successfully split large folio.\n");
+                    } else {
+                        pr_debug("Failed to split large folio.\n");
+                    }
+                    folio_unlock(folio);
                 }
+            } else {
+                // struct folio *larger_folio = folio_order(orig_folio) > folio_order(folio) ? orig_folio : folio;
+                // folio_lock(larger_folio);
+                // if (!split_folio(larger_folio)) {
+                //     atomic_inc(&stat_folios_split);
+                //     pr_info("Successfully split a different-ordered large folio.\n");
+                // }
+                // folio_unlock(larger_folio);
             }
             folio_put(orig_folio);
         } else {
@@ -347,13 +396,20 @@ static void oob_dedup_do_scan(void)
 		
 		folio = filemap_get_folio(slot->mapping, oob_scan.pgoff);
 		if (!IS_ERR(folio)) {
-			check_and_store_folio(folio, slot->mapping, oob_scan.pgoff);
-            folio_put(folio);
-		}
+			long nr = folio_nr_pages(folio);
+			pgoff_t folio_start = folio_index(folio);
 
-        pages_done++;
-        atomic_inc(&stat_pages_scanned);
-        oob_scan.pgoff++;
+			check_and_store_folio(folio, slot->mapping, oob_scan.pgoff);
+			folio_put(folio);
+
+			oob_scan.pgoff = folio_start + nr;
+			pages_done += nr;
+			atomic_add(nr, &stat_pages_scanned);
+		} else {
+			oob_scan.pgoff++;
+			pages_done++;
+			atomic_inc(&stat_pages_scanned);
+		}
 
 		unsigned long max_pages = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
         if (oob_scan.pgoff >= max_pages || oob_scan.pgoff >= MAX_PAGES_PER_FILE) {
@@ -443,6 +499,11 @@ static ssize_t pages_scanned_show(struct kobject *kobj, struct kobj_attribute *a
     return sysfs_emit(buf, "%d\n", atomic_read(&stat_pages_scanned));
 }
 
+static ssize_t folios_split_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", atomic_read(&stat_folios_split));
+}
+
 static ssize_t sleep_millisecs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
     return sysfs_emit(buf, "%u\n", sleep_millisecs);
@@ -460,12 +521,14 @@ static ssize_t sleep_millisecs_store(struct kobject *kobj, struct kobj_attribute
 static struct kobj_attribute files_queued_attr = __ATTR_RO(files_queued);
 static struct kobj_attribute pages_deduped_attr = __ATTR_RO(pages_deduped);
 static struct kobj_attribute pages_scanned_attr = __ATTR_RO(pages_scanned);
+static struct kobj_attribute folios_split_attr = __ATTR_RO(folios_split);
 static struct kobj_attribute sleep_millisecs_attr = __ATTR_RW(sleep_millisecs);
 
 static struct attribute *oob_dedup_attrs[] = {
     &files_queued_attr.attr,
     &pages_deduped_attr.attr,
     &pages_scanned_attr.attr,
+    &folios_split_attr.attr,
     &sleep_millisecs_attr.attr,
     NULL,
 };
