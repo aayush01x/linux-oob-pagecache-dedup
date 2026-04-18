@@ -414,8 +414,17 @@ static void oob_dedup_do_scan(void)
 		unsigned long max_pages = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
         if (oob_scan.pgoff >= max_pages || oob_scan.pgoff >= MAX_PAGES_PER_FILE) {
             spin_lock(&file_dedup_lock);
-            oob_scan.slot = list_next_entry(slot, list);
-            oob_scan.pgoff = 0;
+	    struct file_dedup_slot *next = list_next_entry(slot, list);
+            if (list_is_head(&next->list, &file_dedup_list))
+                oob_scan.slot = NULL;
+            else
+                oob_scan.slot = next;
+
+            list_del(&slot->list);
+            hash_del(&slot->hash);
+            atomic_dec(&stat_files_queued);
+            file_dedup_slot_free(file_dedup_cache, slot);            
+	    oob_scan.pgoff = 0;
             spin_unlock(&file_dedup_lock);
         }
 
