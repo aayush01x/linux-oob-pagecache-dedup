@@ -22,6 +22,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include "internal.h"
+#include "oob_dedup.h"
 
 /*
  * Regular page slots are stabilized by the page lock even without the tree
@@ -150,12 +151,24 @@ static int invalidate_exceptional_entry2(struct address_space *mapping,
  * point.  Because the caller is about to free (and possibly reuse) those
  * blocks on-disk.
  */
+/* mm/truncate.c */
 void folio_invalidate(struct folio *folio, size_t offset, size_t length)
 {
-	const struct address_space_operations *aops = folio->mapping->a_ops;
+    // Use a safe helper to get a real mapping structure
+    struct address_space *mapping = folio_mapping(folio);
+    
+    // If it's a deduped folio, we need to manually grab a mapping from the rmap_list
+    if (unlikely(folio_test_dedup(folio))) {
+        struct oob_dedup_info *info = folio_dedup_info(folio);
+        struct oob_dedup_rmap_entry *entry;
+        
+        // We just need any valid mapping to find the a_ops
+        entry = list_first_entry(&info->rmap_list, struct oob_dedup_rmap_entry, list);
+        mapping = entry->mapping;
+    }
 
-	if (aops->invalidate_folio)
-		aops->invalidate_folio(folio, offset, length);
+    if (mapping && mapping->a_ops->invalidate_folio)
+        mapping->a_ops->invalidate_folio(folio, offset, length);
 }
 EXPORT_SYMBOL_GPL(folio_invalidate);
 
@@ -171,6 +184,7 @@ EXPORT_SYMBOL_GPL(folio_invalidate);
  */
 static void truncate_cleanup_folio(struct folio *folio)
 {
+
 	if (folio_mapped(folio))
 		unmap_mapping_folio(folio);
 
@@ -188,7 +202,7 @@ static void truncate_cleanup_folio(struct folio *folio)
 
 int truncate_inode_folio(struct address_space *mapping, struct folio *folio)
 {
-	if (folio->mapping != mapping)
+	if (!folio_shares_mapping(folio, mapping))
 		return -EIO;
 
 	truncate_cleanup_folio(folio);
@@ -234,7 +248,9 @@ static int try_folio_split_or_unmap(struct folio *folio)
  */
 bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 {
-	loff_t pos = folio_pos(folio);
+	struct address_space *mapping = folio_mapping(folio);
+	pgoff_t target_index = start >> PAGE_SHIFT;
+	loff_t pos = folio_pos_near(folio, mapping, target_index);
 	unsigned int offset, length;
 
 	if (pos < start)
@@ -249,7 +265,7 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 
 	folio_wait_writeback(folio);
 	if (length == folio_size(folio)) {
-		truncate_inode_folio(folio->mapping, folio);
+		truncate_inode_folio(mapping, folio);
 		return true;
 	}
 
@@ -268,7 +284,7 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 		return true;
 	if (folio_test_dirty(folio))
 		return false;
-	truncate_inode_folio(folio->mapping, folio);
+	truncate_inode_folio(mapping, folio);
 	return true;
 }
 
@@ -388,8 +404,9 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
 		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
-		for (i = 0; i < folio_batch_count(&fbatch); i++)
-			truncate_cleanup_folio(fbatch.folios[i]);
+		for (i = 0; i < folio_batch_count(&fbatch); i++){
+
+			truncate_cleanup_folio(fbatch.folios[i]);}
 		delete_from_page_cache_batch(mapping, &fbatch);
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
 			folio_unlock(fbatch.folios[i]);
@@ -400,7 +417,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	same_folio = (lstart >> PAGE_SHIFT) == (lend >> PAGE_SHIFT);
 	folio = __filemap_get_folio(mapping, lstart >> PAGE_SHIFT, FGP_LOCK, 0);
 	if (!IS_ERR(folio)) {
-		same_folio = lend < folio_pos(folio) + folio_size(folio);
+		same_folio = lend < folio_pos_in(folio, mapping) + folio_size(folio);
 		if (!truncate_inode_partial_folio(folio, lstart, lend)) {
 			start = folio_next_index(folio);
 			if (same_folio)
@@ -444,7 +461,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 				continue;
 
 			folio_lock(folio);
-			VM_BUG_ON_FOLIO(!folio_contains(folio, indices[i]), folio);
+			VM_BUG_ON_FOLIO(!folio_shares_index(folio, mapping, indices[i]), folio);
 			folio_wait_writeback(folio);
 			truncate_inode_folio(mapping, folio);
 			folio_unlock(folio);
@@ -594,7 +611,7 @@ EXPORT_SYMBOL(invalidate_mapping_pages);
 static int invalidate_complete_folio2(struct address_space *mapping,
 					struct folio *folio)
 {
-	if (folio->mapping != mapping)
+	if (!folio_shares_mapping(folio, mapping))
 		return 0;
 
 	if (!filemap_release_folio(folio, GFP_KERNEL))
@@ -624,7 +641,7 @@ static int folio_launder(struct address_space *mapping, struct folio *folio)
 {
 	if (!folio_test_dirty(folio))
 		return 0;
-	if (folio->mapping != mapping || mapping->a_ops->launder_folio == NULL)
+	if (!folio_shares_mapping(folio, mapping) || mapping->a_ops->launder_folio == NULL)
 		return 0;
 	return mapping->a_ops->launder_folio(folio);
 }
@@ -680,11 +697,11 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 			}
 
 			folio_lock(folio);
-			if (unlikely(folio->mapping != mapping)) {
+			if (unlikely(!folio_shares_mapping(folio, mapping))) {
 				folio_unlock(folio);
 				continue;
 			}
-			VM_BUG_ON_FOLIO(!folio_contains(folio, indices[i]), folio);
+			VM_BUG_ON_FOLIO(!folio_shares_index(folio, mapping, indices[i]), folio);
 			folio_wait_writeback(folio);
 
 			if (folio_mapped(folio))

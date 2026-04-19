@@ -53,6 +53,7 @@
 *.zst
 Module.symvers
 modules.order
+makelog.txt
 
 #
 # Top-level generic files
