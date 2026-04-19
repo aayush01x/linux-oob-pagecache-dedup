@@ -15,6 +15,8 @@
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
 #include "oob_dedup.h"
+#include <linux/memcontrol.h>
+#include "internal.h"
 
 /* Global Queue and Thread Data */
 static LIST_HEAD(file_dedup_list);
@@ -30,7 +32,7 @@ static struct kmem_cache *dedup_info_cache;
 
 static unsigned int sleep_millisecs = 20;
 static unsigned int pages_to_scan = 100;
-#define MAX_PAGES_PER_FILE 1024
+#define MAX_PAGES_PER_FILE 1048576
 
 /* sysfs kobject and counters for the sysfs layer */
 static struct kobject *oob_dedup_kobj;
@@ -172,7 +174,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         goto out_unlock;
     }
     
-    if (!folio_mapping(orig_folio)) {
+    if (!orig_folio->mapping) {
         err = -ESTALE;
         goto out_unlock;
     }
@@ -240,6 +242,18 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 
     lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
 
+#ifdef CONFIG_MEMCG
+    if (dup_folio->memcg_data) {
+        mem_cgroup_uncharge(dup_folio);
+    }
+#endif
+    
+    if (folio_test_lru(dup_folio)) {
+        if (folio_isolate_lru(dup_folio)) {
+            /* removing the lru reference */
+            folio_put(dup_folio); 
+        }
+    }
 
     // orphan the dup_folio
     dup_folio->mapping = NULL;
@@ -251,6 +265,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
         folio_pfn(dup_folio),folio_ref_count(dup_folio));
     folio_put(dup_folio);
+    // folio_put(dup_folio);
 
     atomic_inc(&stat_pages_deduped);
     return 0;
