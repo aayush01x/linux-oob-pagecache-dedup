@@ -771,79 +771,89 @@ static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
 	folio = __iomap_get_folio(iter, pos, len);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
-if (folio_test_dedup(folio)) {
+	if (folio_test_dedup(folio)) {
 		struct folio *new_folio;
 		struct address_space *mapping = iter->inode->i_mapping;
 		pgoff_t index = folio_index_in(folio, mapping);
+		long nr = folio_nr_pages(folio);
 		void *xa_ret;
 		int err;
 
-		pr_info("OOB_DEDUP: Write intercepted on deduped folio (Inode: %lu, Index: %lu)\n", 
+		pr_debug("OOB_DEDUP: COW break on deduped folio (Inode: %lu, Index: %lu)\n",
 			iter->inode->i_ino, index);
 
-		pr_info("OOB_DEDUP: new folio created\n");
-		new_folio = filemap_alloc_folio(mapping_gfp_mask(mapping), folio_order(folio));
+		/* Step 1: Allocate new private folio */
+		new_folio = filemap_alloc_folio(mapping_gfp_mask(mapping),
+						folio_order(folio));
 		if (!new_folio) {
-			pr_err("OOB_DEDUP: Failed to allocate dummy folio\n");
 			status = -ENOMEM;
 			goto out_unlock;
 		}
 
-		err = mem_cgroup_charge(new_folio, NULL, mapping_gfp_mask(mapping));
+		/* Step 2: Charge to memcg before it's visible */
+		err = mem_cgroup_charge(new_folio, NULL,
+					mapping_gfp_mask(mapping));
 		if (err) {
-			folio_put(new_folio); 
+			folio_put(new_folio);
 			status = err;
 			goto out_unlock;
 		}
-		
+
+		/* Step 3: Copy data and transfer uptodate flag */
 		folio_copy(new_folio, folio);
-		
 		if (folio_test_uptodate(folio))
 			folio_mark_uptodate(new_folio);
-		pr_info("OOB_DEDUP: Successfully allocated and copied data to new folio.\n");
 
+		/* Step 4: Set identity on private folio */
 		new_folio->mapping = mapping;
 		new_folio->index = index;
-		
-		pr_info("OOB_DEDUP: setup mapping and index too\n");
-		
-		folio_lock(new_folio);
-		
+
+		/* Step 5: Lock — non-contended, folio is invisible to others */
+		__folio_set_locked(new_folio);
+
+		/* Step 6: Add XArray ref BEFORE store (matches __filemap_add_folio) */
+		folio_ref_add(new_folio, nr);
+
+		/* Step 7: Atomically replace shared folio in XArray */
 		xa_lock_irq(&mapping->i_pages);
-		
-		pr_info("OOB_DEDUP: trying to replace in xarray\n");
-	
-		xa_ret = __xa_store(&mapping->i_pages, index, new_folio, GFP_ATOMIC);
-	
+		xa_ret = __xa_store(&mapping->i_pages, index, new_folio,
+				    GFP_ATOMIC);
+		xa_unlock_irq(&mapping->i_pages);
+
 		if (xa_is_err(xa_ret)) {
-			xa_unlock_irq(&mapping->i_pages);
-			
-			folio_unlock(new_folio);
-			folio_put(new_folio); 
-			
+			/* Rollback everything */
+			folio_ref_sub(new_folio, nr);
+			mem_cgroup_uncharge(new_folio);
+			new_folio->mapping = NULL;
+			__folio_clear_locked(new_folio);
+			folio_put(new_folio);
 			status = xa_err(xa_ret);
 			goto out_unlock;
 		}
-		folio_get(new_folio);
-		folio_put(folio);
-		xa_unlock_irq(&mapping->i_pages);
-	
-		pr_info("OOB_DEDUP: replacement successful\n");
 
+		/* Step 8: Restore NR_FILE_PAGES (decremented during dedup) */
+		lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, nr);
+
+		/* Step 9: Add to LRU for reclaim */
 		folio_add_lru(new_folio);
-		
-	
-		
-		 oob_dedup_disconnect_folio(folio, mapping);
-		
-		if (folio_test_dedup(folio)) pr_info("OOB_DEDUP:folio now not deduped, which should be the case in current test\n");
-		if (folio_test_dedup(new_folio)) pr_info("OOB_DEDUP: bug \n");
-		__iomap_put_folio(iter, pos, 0, folio);
-		
-		//iomap_write_failed(iter->inode, pos, len);
-		
+
+		/* Step 10: Disconnect shared folio from this mapping's rmap */
+		oob_dedup_disconnect_folio(folio, mapping);
+
+		/* Step 11: Drop shared folio's orphaned XArray ref */
+		folio_put(folio);
+
+		/*
+		 * Step 12: Release old folio — unlock + drop lookup ref.
+		 * Don't use __iomap_put_folio here: the put_folio callback
+		 * may dereference folio->mapping which is still tagged
+		 * if other mappings share this folio (N-way dedup).
+		 */
+		folio_unlock(folio);
+		folio_put(folio);
+
+		/* Continue with the new private folio */
 		folio = new_folio;
-		//return -EBUSY;
 	}
 	/*
 	 * Now we have a locked folio, before we do anything with it we need to
