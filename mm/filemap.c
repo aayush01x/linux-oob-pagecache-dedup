@@ -1909,6 +1909,7 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
 	struct folio *folio;
 
 repeat:
+	//pr_info("OOB DEDUP: filemap_get_folio called\n");
 	folio = filemap_get_entry(mapping, index);
 	if (xa_is_value(folio))
 		folio = NULL;
@@ -1926,7 +1927,7 @@ repeat:
 		}
 
 		/* Has the page been truncated? */
-		// pr_info("filemap_get_folio was called\n");
+	//pr_info("just before checking\n");
     if (unlikely(!folio_shares_mapping(folio,mapping))) {
       // pr_info("__filemap_get_folio was called here and returned with error\n");
 			folio_unlock(folio);
@@ -1943,9 +1944,12 @@ repeat:
 		if (folio_test_idle(folio))
 			folio_clear_idle(folio);
 	}
-
-	if (fgp_flags & FGP_STABLE)
+	
+	//if (folio_test_dedup(folio)) pr_info("OOB DEDUP: crash location candidate 1\n");
+	// we can skip this function as a deduped folio is never dirty
+	if ((fgp_flags & FGP_STABLE) && !folio_test_dedup(folio))
 		folio_wait_stable(folio);
+	//if (folio_test_dedup(folio)) pr_info("OOB DEDUP: cleared\n");
 no_page:
 	if (!folio && (fgp_flags & FGP_CREAT)) {
 		unsigned order = FGF_GET_ORDER(fgp_flags);

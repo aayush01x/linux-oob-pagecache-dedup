@@ -18,6 +18,7 @@
 #include <linux/sched/signal.h>
 #include <linux/migrate.h>
 #include "trace.h"
+#include "../../mm/oob_dedup.h"
 
 #include "../internal.h"
 
@@ -770,7 +771,15 @@ static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
 	folio = __iomap_get_folio(iter, pos, len);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
-
+	if (folio_test_dedup(folio)) {
+        pr_info("OOB_DEDUP: Write intercepted on deduped folio Inode: %lu", 
+                iter->inode->i_ino);
+        
+        	__iomap_put_folio(iter, pos, 0, folio);
+		iomap_write_failed(iter->inode, pos, len);
+	
+		return -EBUSY;
+    }
 	/*
 	 * Now we have a locked folio, before we do anything with it we need to
 	 * check that the iomap we have cached is not stale. The inode extent
