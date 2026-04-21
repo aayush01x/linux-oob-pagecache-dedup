@@ -771,80 +771,14 @@ static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
 	folio = __iomap_get_folio(iter, pos, len);
 	if (IS_ERR(folio))
 		return PTR_ERR(folio);
-if (folio_test_dedup(folio)) {
-		struct folio *new_folio;
-		struct address_space *mapping = iter->inode->i_mapping;
-		pgoff_t index = folio_index_in(folio, mapping);
-		void *xa_ret;
-		int err;
 
-		pr_info("OOB_DEDUP: Write intercepted on deduped folio (Inode: %lu, Index: %lu)\n", 
-			iter->inode->i_ino, index);
-
-		pr_info("OOB_DEDUP: new folio created\n");
-		new_folio = filemap_alloc_folio(mapping_gfp_mask(mapping), folio_order(folio));
-		if (!new_folio) {
-			pr_err("OOB_DEDUP: Failed to allocate dummy folio\n");
-			status = -ENOMEM;
-			goto out_unlock;
-		}
-
-		err = mem_cgroup_charge(new_folio, NULL, mapping_gfp_mask(mapping));
-		if (err) {
-			folio_put(new_folio); 
-			status = err;
-			goto out_unlock;
-		}
-		
-		folio_copy(new_folio, folio);
-		
-		if (folio_test_uptodate(folio))
-			folio_mark_uptodate(new_folio);
-		pr_info("OOB_DEDUP: Successfully allocated and copied data to new folio.\n");
-
-		new_folio->mapping = mapping;
-		new_folio->index = index;
-		
-		pr_info("OOB_DEDUP: setup mapping and index too\n");
-		
-		folio_lock(new_folio);
-		
-		xa_lock_irq(&mapping->i_pages);
-		
-		pr_info("OOB_DEDUP: trying to replace in xarray\n");
-	
-		xa_ret = __xa_store(&mapping->i_pages, index, new_folio, GFP_ATOMIC);
-	
-		if (xa_is_err(xa_ret)) {
-			xa_unlock_irq(&mapping->i_pages);
-			
-			folio_unlock(new_folio);
-			folio_put(new_folio); 
-			
-			status = xa_err(xa_ret);
-			goto out_unlock;
-		}
-		folio_get(new_folio);
-		folio_put(folio);
-		xa_unlock_irq(&mapping->i_pages);
-	
-		pr_info("OOB_DEDUP: replacement successful\n");
-
-		folio_add_lru(new_folio);
-		
-	
-		
-		 oob_dedup_disconnect_folio(folio, mapping);
-		
-		if (folio_test_dedup(folio)) pr_info("OOB_DEDUP:folio now not deduped, which should be the case in current test\n");
-		if (folio_test_dedup(new_folio)) pr_info("OOB_DEDUP: bug \n");
-		__iomap_put_folio(iter, pos, 0, folio);
-		
-		//iomap_write_failed(iter->inode, pos, len);
-		
-		folio = new_folio;
-		//return -EBUSY;
-	}
+  // dedup hook 
+  if (folio_test_dedup(folio)) {
+	  status = oob_folio_break_dedup(iter->inode->i_mapping, &folio, pos, len);
+    if (unlikely(status))
+        goto out_unlock;
+    pr_info("OOB_DEDUP: provided a new folio for write finish");
+  }
 	/*
 	 * Now we have a locked folio, before we do anything with it we need to
 	 * check that the iomap we have cached is not stale. The inode extent

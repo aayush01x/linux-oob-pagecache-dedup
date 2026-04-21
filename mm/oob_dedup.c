@@ -5,6 +5,7 @@
 #include <linux/spinlock.h>
 #include <linux/hashtable.h>
 #include <linux/pagemap.h>
+#include <linux/swap.h>
 #include "file_dedup_slot.h"
 #include <linux/init.h>
 #include <linux/module.h>
@@ -802,11 +803,133 @@ int oob_dedup_evict_inode(struct inode *inode)
     return 0;
 }
 
+void oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping, 
+                     pgoff_t index, struct folio* folio)
+{
+    struct oob_dedup_rmap_entry *slot, *tmp;
+    // unsigned  long flags;
+    bool found = false;
+    bool dissolve = false;
+    //spin_lock_irqsave(&info->lock, flags);
+    list_for_each_entry_safe(slot, tmp, &info->rmap_list, list) {
+        if (slot->mapping == mapping && slot->index == index) {
+            list_del(&slot->list);
+            info->rmap_count--;
+            kmem_cache_free(rmap_entry_cache, slot);
+            found = true;
+            break; 
+        }
+    }
+
+    if (unlikely(!found)) {
+        pr_warn("OOB_DEDUP: Attempted to remove non-existent rmap slot for Inode %lu\n",
+                mapping->host->i_ino);
+        return;
+    }
+
+
+    if (info->rmap_count == 1) {
+        struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
+                                           struct oob_dedup_rmap_entry, list);
+        
+        folio->mapping = last->mapping;
+        folio->index = last->index;
+        list_del(&last->list);
+        kmem_cache_free(rmap_entry_cache, last);
+        dissolve = true;
+    }
+    //spin_unlock_irqrestore(&info->lock, flags);
+
+    if(dissolve){
+        kmem_cache_free(dedup_info_cache,info);
+    }
+
+        //
+    // if (info->rmap_count == 1) {
+    //     pr_debug("OOB_DEDUP: Hub %p now has only one owner left.\n", info);
+    // }
+}
+
+
+
+int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop, 
+                          loff_t pos, size_t len)
+{
+    struct folio *old_folio = *foliop;
+    struct folio *new_folio = NULL;
+    struct oob_dedup_info *info = folio_dedup_info(old_folio);
+    int err = 0;
+
+    // base index calculation
+    pgoff_t index = (pos >> PAGE_SHIFT) & ~((1UL << folio_order(old_folio)) - 1);
+    XA_STATE(xas, &mapping->i_pages, index);
+
+    // allocate folio of same order 
+    new_folio = filemap_alloc_folio(mapping_gfp_mask(mapping), folio_order(old_folio));
+    if (!new_folio)
+        return -ENOMEM;
+
+#ifdef CONFIG_MEMCG
+    err = mem_cgroup_charge(new_folio, NULL, mapping_gfp_mask(mapping));
+    if (err) {
+        folio_put(new_folio);
+        return err;
+    }
+#endif
+    __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
+    
+    new_folio->mapping = mapping;
+    new_folio->index = index;
+    // copy the folio and data
+    folio_copy(new_folio, old_folio);
+    __folio_mark_uptodate(new_folio);
+
+    folio_lock(new_folio);
+
+    // swap the pointers in the x-array
+    spin_lock(&info->lock);
+    xas_lock_irq(&xas);
+
+    // if old folio replaced  
+    if (unlikely(xas_load(&xas) != old_folio)) {
+        xas_unlock_irq(&xas);
+        spin_unlock(&info->lock);
+        folio_unlock(new_folio);
+        folio_put(new_folio);
+        return -EAGAIN;
+    }
+
+    // xarray update
+    xas_store(&xas, new_folio);
+    if (xas_error(&xas)) {
+        xas_unlock_irq(&xas);
+        spin_unlock(&info->lock);
+        folio_unlock(new_folio);
+        folio_put(new_folio);
+        return xas_error(&xas);
+    }
+
+    // remove the info about the folio from the list
+    oob_rmap_remove(info, mapping, index, old_folio);
+
+    xas_unlock_irq(&xas);
+    spin_unlock(&info->lock);
+
+    // state management
+    folio_get(new_folio);
+    folio_add_lru(new_folio);
+    folio_put(old_folio);
+    folio_unlock(old_folio);
+
+    *foliop = new_folio;
+    return 0;
+}
+
 
 EXPORT_SYMBOL_GPL(oob_dedup_add_file);
 // EXPORT_SYMBOL_GPL(oob_dedup_remove_file);
 EXPORT_SYMBOL_GPL(oob_dedup_evict_inode);
-
+EXPORT_SYMBOL_GPL(oob_folio_break_dedup);
 subsys_initcall(oob_dedup_init);
 
 #ifdef CONFIG_KUNIT

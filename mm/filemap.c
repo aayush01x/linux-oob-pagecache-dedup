@@ -238,7 +238,7 @@ void filemap_free_folio(struct address_space *mapping, struct folio *folio)
 {
 	void (*free_folio)(struct folio *);
 	int refs = 1;
-
+  
 	free_folio = mapping->a_ops->free_folio;
 	if (free_folio)
 		free_folio(folio);
