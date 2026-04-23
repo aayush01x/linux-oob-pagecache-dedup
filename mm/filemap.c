@@ -144,9 +144,7 @@ static void page_cache_delete(struct address_space *mapping,
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
 
-	if (folio_test_dedup(folio)) {
-    oob_dedup_disconnect_folio(folio, mapping);
-  } else {
+	if (!folio_test_dedup(folio)) {
     folio->mapping = NULL;
   }
 	/* Leave page->index set: truncation lookup relies upon it */
@@ -258,38 +256,41 @@ void filemap_free_folio(struct address_space *mapping, struct folio *folio)
  */
 void filemap_remove_folio(struct folio *folio)
 {
-	struct address_space *mapping = folio->mapping;
-	struct inode *inode;
-	unsigned long pfn;
+  struct address_space *mapping;
+  struct inode *inode;
 
+  if (unlikely(folio_test_dedup(folio))) {
+      struct oob_dedup_info *info = folio_dedup_info(folio);
+      struct oob_dedup_rmap_entry *entry;
+      entry = list_first_entry(&info->rmap_list, struct oob_dedup_rmap_entry, list);
+      mapping = entry->mapping;
+  } 
+  else {
+      mapping = folio->mapping;
+  }
 
-	/* 3. Validate inode/host pointer */
-	inode = mapping->host;
-	if (unlikely(!inode || (unsigned long)inode >= 0xffffffffdead0000)) {
-	pfn = folio_pfn(folio); // Get the Physical Frame Number
-    
-    pr_emerg("BUG: Zombie Folio Detected!\n");
-    pr_emerg("Folio Pointer: %p\n", folio);
-    pr_emerg("Physical PFN:  0x%lx\n", pfn);
-    pr_emerg("Folio Flags:   0x%lx\n", folio->flags);
-    pr_emerg("Mapping Ptr:   %p\n", mapping);
-    
-    /* Check if the mapping itself is poisoned */
-    if ((unsigned long)mapping >= 0xffffffffdead0000)
-        pr_emerg("ALERT: Mapping pointer is ALSO poisoned!\n");
-		
-	}
+  if (unlikely(!mapping))
+      return;
 
-	BUG_ON(!folio_test_locked(folio));
-	spin_lock(&mapping->host->i_lock);
-	xa_lock_irq(&mapping->i_pages);
-	__filemap_remove_folio(folio, NULL);
-	xa_unlock_irq(&mapping->i_pages);
-	if (mapping_shrinkable(mapping))
-		inode_add_lru(mapping->host);
-	spin_unlock(&mapping->host->i_lock);
+  inode = mapping->host;
+  if (unlikely(!inode))
+      return;
 
-	filemap_free_folio(mapping, folio);
+  BUG_ON(!folio_test_locked(folio));
+
+  spin_lock(&inode->i_lock);
+  xa_lock_irq(&mapping->i_pages);
+
+  __filemap_remove_folio(folio, NULL);
+
+  xa_unlock_irq(&mapping->i_pages);
+
+  if (mapping_shrinkable(mapping))
+      inode_add_lru(inode);
+      
+  spin_unlock(&inode->i_lock);
+
+  filemap_free_folio(mapping, folio);
 }
 
 /*
@@ -339,10 +340,11 @@ static void page_cache_delete_batch(struct address_space *mapping,
 
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
-		if (folio_test_dedup(folio))
-      oob_dedup_disconnect_folio(folio, mapping);
-    else
-      folio->mapping = NULL;
+		if (folio_test_dedup(folio)) {
+        oob_dedup_disconnect_folio(folio, mapping);
+    } else {
+        folio->mapping = NULL;
+    }
 		/* Leave folio->index set: truncation lookup relies on it */
 
 		i++;
@@ -2263,6 +2265,7 @@ out:
 	return folio_batch_count(fbatch);
 }
 EXPORT_SYMBOL(filemap_get_folios);
+
 
 /**
  * filemap_get_folios_contig - Get a batch of contiguous folios

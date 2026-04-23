@@ -202,9 +202,21 @@ static void truncate_cleanup_folio(struct folio *folio)
 
 int truncate_inode_folio(struct address_space *mapping, struct folio *folio)
 {
+	struct address_space *fake_mapping = NULL;
 	if (!folio_shares_mapping(folio, mapping))
 		return -EIO;
 
+	if (unlikely(folio_test_dedup(folio))) {
+        fake_mapping = folio->mapping;
+        folio->mapping = mapping;
+    }
+
+    truncate_cleanup_folio(folio);
+    filemap_remove_folio(folio); 
+
+    if (fake_mapping && folio->mapping == mapping) {
+        folio->mapping = fake_mapping;
+    }
 	truncate_cleanup_folio(folio);
 	filemap_remove_folio(folio);
 	return 0;
@@ -440,8 +452,15 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	}
 
 	index = start;
+	unsigned long loop2_spins = 0;
 	while (index < end) {
 		cond_resched();
+		loop2_spins++;
+		if (loop2_spins > 400) {
+            pr_emerg_ratelimited("OOB_DEDUP: Loop 2 Infinite Spin Detected! "
+                                 "index=%lu, start=%lu, end=%lu\n", 
+                                 index, start, end);
+        }
 		if (!find_get_entries(mapping, &index, end - 1, &fbatch,
 				indices)) {
 			/* If all gone from start onwards, we're done */
