@@ -217,8 +217,6 @@ int truncate_inode_folio(struct address_space *mapping, struct folio *folio)
     if (fake_mapping && folio->mapping == mapping) {
         folio->mapping = fake_mapping;
     }
-	truncate_cleanup_folio(folio);
-	filemap_remove_folio(folio);
 	return 0;
 }
 
