@@ -115,6 +115,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     struct oob_dedup_info *info = NULL, *new_info = NULL;
     struct oob_dedup_rmap_entry *orig_entry = NULL, *dup_entry = NULL;
     pgoff_t base_index = (index >> folio_order(dup_folio)) << folio_order(dup_folio);
+
     XA_STATE(xas, &mapping->i_pages, base_index);
     xas_set_order(&xas, base_index, folio_order(orig_folio));
     int err = -ENOMEM;
@@ -267,6 +268,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 
     pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
         folio_pfn(dup_folio),folio_ref_count(dup_folio));
+    pr_info("OOB_DEDUP: folio flags for dup_folio  0x%lx\n", dup_folio->flags);
+    pr_info("OOB_DEDUP: folio flags for orig_folio  0x%lx\n", orig_folio->flags);
     folio_put(dup_folio);
     // folio_put(dup_folio);
 
@@ -289,7 +292,7 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
     struct page_entry *entry;
     struct hlist_node *tmp;
     bool found = false;
-    int err;
+    int err = 1;
     u32 hash = hash_folio(folio);
 
     spin_lock(&folio_hash_lock);
@@ -805,9 +808,12 @@ int oob_dedup_evict_inode(struct inode *inode)
     return 0;
 }
 
-void oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping, 
+
+//enters with a  spin lock on info so can't dissolve it here
+bool oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping, 
                      pgoff_t index, struct folio* folio)
 {
+	pr_info("OOB_DEDUP: entering remove function\n");
     struct oob_dedup_rmap_entry *slot, *tmp;
     // unsigned  long flags;
     bool found = false;
@@ -826,7 +832,7 @@ void oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping,
     if (unlikely(!found)) {
         pr_warn("OOB_DEDUP: Attempted to remove non-existent rmap slot for Inode %lu\n",
                 mapping->host->i_ino);
-        return;
+        return false;
     }
 
 
@@ -841,10 +847,9 @@ void oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping,
         dissolve = true;
     }
     //spin_unlock_irqrestore(&info->lock, flags);
+	
+	return dissolve;
 
-    if(dissolve){
-        kmem_cache_free(dedup_info_cache,info);
-    }
 
         //
     // if (info->rmap_count == 1) {
@@ -860,7 +865,10 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
     struct folio *old_folio = *foliop;
     struct folio *new_folio = NULL;
     struct oob_dedup_info *info = folio_dedup_info(old_folio);
-    int err = 0;
+    int __maybe_unused err = 0;
+    unsigned long old_pfn ;
+    unsigned long new_pfn ;
+    bool dissolve = false;
 
     // base index calculation
     pgoff_t index = (pos >> PAGE_SHIFT) & ~((1UL << folio_order(old_folio)) - 1);
@@ -879,18 +887,23 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
     }
 #endif
     __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
-    
+    if (folio_test_large(new_folio)){
+		pr_info("OOB_DEDUP: i have a large folio\n");
+    __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
+}
     new_folio->mapping = mapping;
     new_folio->index = index;
     // copy the folio and data
     folio_copy(new_folio, old_folio);
+    pr_info("OOB_DEDUP: copied the old data\n");
     __folio_mark_uptodate(new_folio);
 
     folio_lock(new_folio);
 
     // swap the pointers in the x-array
-    spin_lock(&info->lock);
+    
     xas_lock_irq(&xas);
+    spin_lock(&info->lock);
 
     // if old folio replaced  
     if (unlikely(xas_load(&xas) != old_folio)) {
@@ -901,27 +914,67 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         return -EAGAIN;
     }
 
+	pr_info("OOB_DEDUP: before switch \n OOB_DEDUP: ref count old folio %d\n", folio_ref_count(old_folio));
+	pr_info("OOB_DEDUP: ref count new folio %d\n", folio_ref_count(new_folio));
     // xarray update
+    
+    old_pfn = folio_pfn(old_folio);
+    new_pfn = folio_pfn(new_folio);
+    xas_set_order(&xas, index, folio_order(new_folio));
     xas_store(&xas, new_folio);
     if (xas_error(&xas)) {
-        xas_unlock_irq(&xas);
+        pr_info("OOB_DEDUP: unsucessful replacement\n");
         spin_unlock(&info->lock);
+        xas_unlock_irq(&xas);
         folio_unlock(new_folio);
         folio_put(new_folio);
         return xas_error(&xas);
+    }else {
+        /* VERIFICATION BLOCK */
+        struct folio *check_folio = xas_load(&xas); 
+        unsigned long check_pfn = check_folio ? folio_pfn(check_folio) : 0;
+
+        if (check_pfn == new_pfn) {
+            pr_info("OOB_DEDUP: [SUCCESS] Swapped PFN %lx -> %lx at index %lu\n", 
+                     old_pfn, new_pfn, index);
+        } else {
+            pr_err("OOB_DEDUP: [CRITICAL] XArray verify failed! Found PFN %lx, expected %lx\n",
+                    check_pfn, new_pfn);
+        }
     }
+    pr_info("Folio Flags for old folio:   0x%lx\n", old_folio->flags);
+    pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);
+    pr_info("OOB_DEDUP: after switch \n OOB_DEDUP: ref count old folio, expected is %d\n", folio_ref_count(old_folio));
+	pr_info("OOB_DEDUP: ref count new folio, expectation same %d\n", folio_ref_count(new_folio));
+
+	//folio_mark_dirty(new_folio);
+	//folio_clear_dirty(old_folio);
+	
+	pr_info("check after chaning flags\n");
+    pr_info("Folio Flags for old folio:   0x%lx\n", old_folio->flags);
+    pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);	
 
     // remove the info about the folio from the list
-    oob_rmap_remove(info, mapping, index, old_folio);
+    dissolve = oob_rmap_remove(info, mapping, index, old_folio);
+    pr_info("OOB_DEDUP: not printing oob_rmap remove entering pr_info?\n");
+    folio_put(old_folio);
+      
+       spin_unlock(&info->lock);
+       if(dissolve){
+        kmem_cache_free(dedup_info_cache,info);}
+       xas_unlock_irq(&xas);
+        
+   
 
-    xas_unlock_irq(&xas);
-    spin_unlock(&info->lock);
+  
+ 
 
     // state management
-    folio_get(new_folio);
+    folio_get(new_folio);  // for xas store accounting
     folio_add_lru(new_folio);
-    folio_put(old_folio);
+    
     folio_unlock(old_folio);
+    folio_put(old_folio);
 
     *foliop = new_folio;
     return 0;

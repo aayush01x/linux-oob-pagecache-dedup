@@ -259,6 +259,26 @@ void filemap_free_folio(struct address_space *mapping, struct folio *folio)
 void filemap_remove_folio(struct folio *folio)
 {
 	struct address_space *mapping = folio->mapping;
+	struct inode *inode;
+	unsigned long pfn;
+
+
+	/* 3. Validate inode/host pointer */
+	inode = mapping->host;
+	if (unlikely(!inode || (unsigned long)inode >= 0xffffffffdead0000)) {
+	pfn = folio_pfn(folio); // Get the Physical Frame Number
+    
+    pr_emerg("BUG: Zombie Folio Detected!\n");
+    pr_emerg("Folio Pointer: %p\n", folio);
+    pr_emerg("Physical PFN:  0x%lx\n", pfn);
+    pr_emerg("Folio Flags:   0x%lx\n", folio->flags);
+    pr_emerg("Mapping Ptr:   %p\n", mapping);
+    
+    /* Check if the mapping itself is poisoned */
+    if ((unsigned long)mapping >= 0xffffffffdead0000)
+        pr_emerg("ALERT: Mapping pointer is ALSO poisoned!\n");
+		
+	}
 
 	BUG_ON(!folio_test_locked(folio));
 	spin_lock(&mapping->host->i_lock);

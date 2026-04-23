@@ -775,6 +775,8 @@ static int iomap_write_begin(struct iomap_iter *iter, loff_t pos,
   // dedup hook 
   if (folio_test_dedup(folio)) {
 	  status = oob_folio_break_dedup(iter->inode->i_mapping, &folio, pos, len);
+	  
+	  // if it is failing, we must still have a reference to the old folio and it is locked
     if (unlikely(status))
         goto out_unlock;
     pr_info("OOB_DEDUP: provided a new folio for write finish");
