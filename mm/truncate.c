@@ -523,8 +523,19 @@ void truncate_inode_pages_range(struct address_space *mapping,
 								indices[i]);
 				}
 			} else {
-				VM_BUG_ON_FOLIO(!folio_shares_index(folio,
-					mapping, indices[i]), folio);
+				/*
+				 * The folio was dissolved from dedup during an
+				 * earlier iteration of this batch (intra-file
+				 * dissolve cleared this XArray slot and already
+				 * decremented nrpages). Check that the folio
+				 * still lives at this index in our mapping
+				 * before trying to remove it again.
+				 */
+				if (folio->mapping != mapping ||
+				    xa_load(&mapping->i_pages, indices[i]) != folio) {
+					folio_unlock(folio);
+					continue;
+				}
 				folio_wait_writeback(folio);
 				truncate_inode_folio(mapping, folio);
 			}
