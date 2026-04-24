@@ -114,8 +114,6 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 {
     struct oob_dedup_info *info = NULL, *new_info = NULL;
     struct oob_dedup_rmap_entry *orig_entry = NULL, *dup_entry = NULL;
-    struct address_space *saved_mapping = NULL;
-    pgoff_t saved_index = 0;
     pgoff_t base_index = (index >> folio_order(dup_folio)) << folio_order(dup_folio);
 
     XA_STATE(xas, &mapping->i_pages, base_index);
@@ -194,10 +192,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         spin_lock_init(&info->lock);
         INIT_LIST_HEAD(&info->rmap_list);
         
-        saved_mapping = orig_folio->mapping;
-        saved_index = orig_folio->index;
-        orig_entry->mapping = saved_mapping;
-        orig_entry->index = saved_index;
+        orig_entry->mapping = orig_folio->mapping;
+        orig_entry->index = orig_folio->index;
         list_add(&orig_entry->list, &info->rmap_list);
         info->rmap_count = 1;
         
@@ -239,8 +235,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 			struct oob_dedup_rmap_entry *last_entry =
 				list_first_entry(&info->rmap_list,
 					struct oob_dedup_rmap_entry, list);
-			orig_folio->mapping = saved_mapping;
-			orig_folio->index = saved_index;
+			orig_folio->mapping = last_entry->mapping;
+			orig_folio->index = last_entry->index;
 			
 			list_del(&last_entry->list);
 			kmem_cache_free(rmap_entry_cache, last_entry);
@@ -252,6 +248,13 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     }
     xas_unlock_irq(&xas);
 
+    /*
+     * Drop the XArray page-cache references from dup_folio.
+     * __filemap_add_folio added nr refs; xas_store replaced the entry
+     * but did not release them.
+     */
+    folio_put_refs(dup_folio, folio_nr_pages(dup_folio));
+
     lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
 
 #ifdef CONFIG_MEMCG
@@ -262,8 +265,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     
     if (folio_test_lru(dup_folio)) {
         if (folio_isolate_lru(dup_folio)) {
-            /* removing the lru reference */
-            folio_put(dup_folio); 
+            /* isolate took a ref; drop it now */
+            folio_put(dup_folio);
         }
     }
 
@@ -276,10 +279,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 
     pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
         folio_pfn(dup_folio),folio_ref_count(dup_folio));
-    pr_info("OOB_DEDUP: folio flags for dup_folio  0x%lx\n", dup_folio->flags);
-    pr_info("OOB_DEDUP: folio flags for orig_folio  0x%lx\n", orig_folio->flags);
+    /* Drop the scanner's filemap_get_folio reference */
     folio_put(dup_folio);
-    // folio_put(dup_folio);
 
     atomic_inc(&stat_pages_deduped);
     return 0;
@@ -390,6 +391,7 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
 static void oob_dedup_do_scan(void)
 {
     struct file_dedup_slot *slot;
+    struct address_space *slot_mapping;
     struct folio *folio;
     unsigned int pages_done = 0;
 
@@ -414,21 +416,39 @@ static void oob_dedup_do_scan(void)
         }
 
         slot = oob_scan.slot;
-		struct inode *inode = slot->mapping->host;
+        /* BUG-11 fix: copy mapping under lock to avoid UAF after unlock */
+        slot_mapping = slot->mapping;
+		struct inode *inode = slot_mapping->host;
 	    inode = igrab(inode); /* Safely attempt to grab the inode */
 	            
-        if (!inode) { // Inode is being deleted
+        if (!inode) {
+            /*
+             * BUG-13 fix: inode is being deleted — advance past this slot
+             * to avoid spinning forever on a dying inode.
+             */
+            struct file_dedup_slot *next = list_next_entry(slot, list);
+            if (list_is_head(&next->list, &file_dedup_list))
+                oob_scan.slot = NULL;
+            else
+                oob_scan.slot = next;
+            oob_scan.pgoff = 0;
+
+            list_del(&slot->list);
+            hash_del(&slot->hash);
+            atomic_dec(&stat_files_queued);
+            file_dedup_slot_free(file_dedup_cache, slot);
             spin_unlock(&file_dedup_lock);
             continue; 
         }
 		spin_unlock(&file_dedup_lock);
 		
-		folio = filemap_get_folio(slot->mapping, oob_scan.pgoff);
+		folio = filemap_get_folio(slot_mapping, oob_scan.pgoff);
 		if (!IS_ERR(folio)) {
 			long nr = folio_nr_pages(folio);
 			pgoff_t folio_start = folio_index(folio);
 
-			check_and_store_folio(folio, slot->mapping, oob_scan.pgoff);
+			/* BUG-27 fix: pass folio base index, not oob_scan.pgoff */
+			check_and_store_folio(folio, slot_mapping, folio_start);
 			folio_put(folio);
 
 			oob_scan.pgoff = folio_start + nr;
