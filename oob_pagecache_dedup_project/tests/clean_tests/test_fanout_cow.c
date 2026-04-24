@@ -28,7 +28,7 @@
 #define FILE_A        "fanout_a.dat"
 #define FILE_B        "fanout_b.dat"
 #define FILE_C        "fanout_c.dat"
-#define SCANNER_WAIT  20
+#define SCANNER_WAIT  5
 
 static int verify_file(const char *path, char expected, long size)
 {
