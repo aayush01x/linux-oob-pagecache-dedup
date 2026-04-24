@@ -150,3 +150,9 @@ static inline loff_t folio_pos_near(struct folio *folio,
     spin_unlock(&info->lock);
     return (loff_t)found_index << PAGE_SHIFT;
 }
+
+/* Index-aware page cache removal for intra-file dedup (defined in filemap.c) */
+extern void filemap_remove_folio_at(struct folio *folio,
+				    struct address_space *mapping,
+				    pgoff_t index);
+

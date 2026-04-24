@@ -252,6 +252,64 @@ void filemap_free_folio(struct address_space *mapping, struct folio *folio)
 }
 
 /**
+ * filemap_remove_folio_at - Remove a deduped folio at a specific XArray index.
+ * @folio: The folio.
+ * @mapping: The address_space owning the XArray slot.
+ * @index: The exact XArray index to remove.
+ *
+ * For intra-file dedup, the same physical folio can appear at multiple indices
+ * in the same address_space. The standard filemap_remove_folio() uses
+ * folio_index_in() which returns the first rmap match — wrong for intra-file
+ * dedup. This function uses the caller-provided @index to remove the correct
+ * XArray slot.
+ *
+ * The folio must be locked and the caller must hold a reference.
+ */
+void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
+			     pgoff_t index)
+{
+	struct inode *inode = mapping->host;
+	long nr = 1;
+
+	BUG_ON(!folio_test_locked(folio));
+
+	spin_lock(&inode->i_lock);
+	xa_lock_irq(&mapping->i_pages);
+
+	trace_mm_filemap_delete_from_page_cache(folio);
+	filemap_unaccount_folio(mapping, folio);
+
+	{
+		XA_STATE(xas, &mapping->i_pages, index);
+
+		mapping_set_update(&xas, mapping);
+
+		if (!folio_test_hugetlb(folio)) {
+			xas_set_order(&xas, index, folio_order(folio));
+			nr = folio_nr_pages(folio);
+		}
+
+		xas_store(&xas, NULL);
+		xas_init_marks(&xas);
+	}
+
+	if (folio_test_dedup(folio))
+		oob_dedup_disconnect_folio(folio, mapping, index);
+
+	if (!folio_test_dedup(folio))
+		folio->mapping = NULL;
+
+	mapping->nrpages -= nr;
+
+	xa_unlock_irq(&mapping->i_pages);
+	if (mapping_shrinkable(mapping))
+		inode_add_lru(inode);
+	spin_unlock(&inode->i_lock);
+
+	filemap_free_folio(mapping, folio);
+}
+
+/**
  * filemap_remove_folio - Remove folio from page cache.
  * @folio: The folio.
  *
