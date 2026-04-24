@@ -294,7 +294,14 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
     struct hlist_node *tmp;
     bool found = false;
     int err = 1;
-    u32 hash = hash_folio(folio);
+    u32 hash;
+
+    /* Already-deduped folios must not be re-scanned: their tagged
+     * mapping pointer would cause GPFs in split_folio and friends. */
+    if (folio_test_dedup(folio))
+        return;
+
+    hash = hash_folio(folio);
 
     spin_lock(&folio_hash_lock);
     hash_for_each_possible_safe(oob_folio_hash, entry, tmp, node, hash) {
@@ -335,22 +342,27 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                         pr_info("Could not deduplicate folio with err code = %d", err);
                     }
                 } else if (nr > 1 && matched * 100 >= nr * merge_threshold_pct) {
-                    pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
-                    folio_lock(folio);
-                    if (!split_folio(folio)) {
-                        atomic_inc(&stat_folios_split);
-                        pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
-                                index);
-                        /*
-                         * Rewind the scanner cursor back to this folio's
-                         * base index so the split (now order-0) pages are
-                         * re-encountered on the very next pass
-                         */
-                        oob_scan.pgoff = index;
+                    /*
+                     * Don't split folios that are already deduped — their
+                     * folio->mapping is a tagged oob_dedup_info pointer,
+                     * and split_huge_page_to_list will GPF trying to
+                     * dereference it as an address_space*.
+                     */
+                    if (folio_test_dedup(folio)) {
+                        pr_debug("Skipping split of already-deduped large folio.\n");
                     } else {
-                        pr_debug("Failed to split large folio.\n");
+                        pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
+                        folio_lock(folio);
+                        if (!split_folio(folio)) {
+                            atomic_inc(&stat_folios_split);
+                            pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
+                                    index);
+                            oob_scan.pgoff = index;
+                        } else {
+                            pr_debug("Failed to split large folio.\n");
+                        }
+                        folio_unlock(folio);
                     }
-                    folio_unlock(folio);
                 }
             } else {
                 // struct folio *larger_folio = folio_order(orig_folio) > folio_order(folio) ? orig_folio : folio;
