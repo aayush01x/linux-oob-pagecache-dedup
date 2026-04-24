@@ -260,8 +260,27 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 {
 	struct address_space *mapping = folio_mapping(folio);
 	pgoff_t target_index = start >> PAGE_SHIFT;
-	loff_t pos = folio_pos_near(folio, mapping, target_index);
+	loff_t pos;
 	unsigned int offset, length;
+
+	/*
+	 * folio_mapping() returns NULL for deduped folios because the
+	 * PAGE_MAPPING_DEDUP tag in folio->mapping triggers the
+	 * PAGE_MAPPING_FLAGS check. Extract a real mapping from the rmap.
+	 */
+	if (unlikely(!mapping && folio_test_dedup(folio))) {
+		struct oob_dedup_info *info = folio_dedup_info(folio);
+		struct oob_dedup_rmap_entry *entry;
+
+		spin_lock(&info->lock);
+		entry = list_first_entry(&info->rmap_list,
+					 struct oob_dedup_rmap_entry, list);
+		mapping = entry->mapping;
+		spin_unlock(&info->lock);
+	}
+
+	pos = folio_pos_near(folio, mapping, target_index);
+
 
 	if (pos < start)
 		offset = start - pos;
