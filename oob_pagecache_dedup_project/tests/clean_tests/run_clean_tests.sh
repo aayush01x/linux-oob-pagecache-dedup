@@ -21,7 +21,7 @@ cleanup_all() {
           sysfs_stat_*.dat fanout_*.dat large_folio_*.dat \
           intra_dedup_stress.dat cascade_*.dat \
           conc_tc_*.dat rededup_*.dat torture_*.dat \
-          parttrunc_*.dat
+          parttrunc_*.dat nfp_*.dat rapid_*.dat cowtrunc_*.dat
 }
 
 compile() {
@@ -68,7 +68,10 @@ for src in test_cow_isolation_auto.c \
            test_concurrent_trunc_cow.c \
            test_rededup_after_cow.c \
            test_mixed_ops_torture.c \
-           test_partial_truncate_dedup.c; do
+           test_partial_truncate_dedup.c \
+           test_nr_file_pages_leak.c \
+           test_rapid_dedup_delete.c \
+           test_cow_during_truncate.c; do
     compile "$src" "common.c"
 done
 
@@ -96,6 +99,11 @@ run_one "Re-Dedup After COW"        test_rededup_after_cow
 run_one "Mixed Ops Torture"         test_mixed_ops_torture
 run_one "Partial Truncate Dedup"    test_partial_truncate_dedup
 
+# ---------- bug-triggering tests ----------
+run_one "NR_FILE_PAGES Leak"        test_nr_file_pages_leak
+run_one "Rapid Dedup-Delete"        test_rapid_dedup_delete
+run_one "COW During Truncate"       test_cow_during_truncate
+
 # ---------- summary ----------
 cleanup_all
 
@@ -113,7 +121,8 @@ rm -f test_cow_isolation_auto test_truncate_deduped test_delete_then_read \
       test_sysfs_stats_auto test_fanout_cow test_large_folio \
       test_intra_file_dedup test_cascade_unlink test_concurrent_trunc_cow \
       test_rededup_after_cow test_mixed_ops_torture \
-      test_partial_truncate_dedup
+      test_partial_truncate_dedup \
+      test_nr_file_pages_leak test_rapid_dedup_delete test_cow_during_truncate
 
 if [ "$FAIL" -gt 0 ]; then
     echo "SOME TESTS FAILED"
