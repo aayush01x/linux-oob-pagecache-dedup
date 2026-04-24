@@ -122,7 +122,7 @@ static inline loff_t folio_pos_in(struct folio *folio, struct address_space *map
 	return (loff_t)folio_index_in(folio, mapping) << PAGE_SHIFT;
 }
 
-void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping);
+void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping, pgoff_t index);
 int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop, 
                           loff_t pos, size_t len);
 

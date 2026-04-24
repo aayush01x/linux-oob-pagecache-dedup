@@ -478,40 +478,43 @@ static int oob_dedup_thread_fn(void *nothing)
  * see page_cache_delete in mm/filemap.c for more info 
  *
  * */
-void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping)
+void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping,
+                                pgoff_t index)
 {
-  struct oob_dedup_info *info = folio_dedup_info(folio);
-  struct oob_dedup_rmap_entry *entry, *tmp;
-  bool dissolve = false;
-	unsigned long flags;
+    struct oob_dedup_info *info = folio_dedup_info(folio);
+    struct oob_dedup_rmap_entry *entry, *tmp;
+    bool dissolve = false;
+    unsigned long flags;
 
-    // since the ancestor? function holds irqsave(non interruptible lock) we need to keep using irqsave locks
     spin_lock_irqsave(&info->lock, flags);
     list_for_each_entry_safe(entry, tmp, &info->rmap_list, list) {
-        if (entry->mapping == mapping) {
+        if (entry->mapping == mapping && entry->index == index) {
             list_del(&entry->list);
             info->rmap_count--;
             kmem_cache_free(rmap_entry_cache, entry);
-            break; 
+            break;
         }
     }
 
-    // last page remaining 
     if (info->rmap_count == 1) {
-        struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
+        /* Dissolve: restore folio to the last remaining owner */
+        struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list,
                                            struct oob_dedup_rmap_entry, list);
         folio->mapping = last->mapping;
         folio->index = last->index;
         list_del(&last->list);
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
+    } else if (info->rmap_count == 0) {
+        folio->mapping = NULL;
+        dissolve = true;
     }
-	spin_unlock_irqrestore(&info->lock, flags);
-    if (dissolve){
+
+    spin_unlock_irqrestore(&info->lock, flags);
+    if (dissolve)
         kmem_cache_free(dedup_info_cache, info);
-   
-        }
 }
+
 
 /* sysfs attribute functions */
 static ssize_t files_queued_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)

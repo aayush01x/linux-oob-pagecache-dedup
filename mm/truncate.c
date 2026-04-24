@@ -450,15 +450,9 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	}
 
 	index = start;
-	unsigned long loop2_spins = 0;
 	while (index < end) {
 		cond_resched();
-		loop2_spins++;
-		if (loop2_spins > 400) {
-            pr_emerg_ratelimited("OOB_DEDUP: Loop 2 Infinite Spin Detected! "
-                                 "index=%lu, start=%lu, end=%lu\n", 
-                                 index, start, end);
-        }
+
 		if (!find_get_entries(mapping, &index, end - 1, &fbatch,
 				indices)) {
 			/* If all gone from start onwards, we're done */

@@ -144,9 +144,18 @@ static void page_cache_delete(struct address_space *mapping,
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
 
-	if (!folio_test_dedup(folio)) {
-    folio->mapping = NULL;
-  }
+	if (folio_test_dedup(folio)) {
+		oob_dedup_disconnect_folio(folio, mapping, f_index);
+		/*
+		 * After disconnect, folio->mapping is already set:
+		 *  - NULL if all owners removed (rmap_count == 0)
+		 *  - last owner's mapping if dissolved (rmap_count == 1)
+		 *  - tagged pointer if still shared (rmap_count > 1)
+		 * Do NOT overwrite it.
+		 */
+	} else {
+		folio->mapping = NULL;
+	}
 	/* Leave page->index set: truncation lookup relies upon it */
 	mapping->nrpages -= nr;
 }
@@ -225,9 +234,11 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	struct address_space *mapping = folio->mapping;
 
 	trace_mm_filemap_delete_from_page_cache(folio);
-	if (unlikely(folio_test_dedup(folio))) {
-		oob_dedup_disconnect_folio(folio, mapping);
-	}
+	/*
+	 * For deduped folios, disconnect is handled inside page_cache_delete()
+	 * (single path) or page_cache_delete_batch() (batch path) where
+	 * the correct XArray index is known.
+	 */
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }
@@ -341,7 +352,7 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
 		if (folio_test_dedup(folio)) {
-        oob_dedup_disconnect_folio(folio, mapping);
+        oob_dedup_disconnect_folio(folio, mapping, xas.xa_index);
     } else {
         folio->mapping = NULL;
     }
@@ -2170,8 +2181,25 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
       if (f_index + folio_nr_pages(folio) - 1 > end)
         goto put;
 
-			if (!folio_trylock(folio))
+			if (!folio_trylock(folio)) {
+				/*
+				 * If this is the same physical folio we already
+				 * have in the batch (intra-file dedup: same folio
+				 * at multiple XArray indices), stop scanning.
+				 * We cannot lock it again and continuing would
+				 * just scan through all remaining duplicate
+				 * entries fruitlessly, causing O(N^2) behavior
+				 * during truncation of large deduped files.
+				 */
+				int j;
+				for (j = 0; j < folio_batch_count(fbatch); j++) {
+					if (fbatch->folios[j] == folio) {
+						folio_put(folio);
+						goto done;
+					}
+				}
 				goto put;
+			}
 			if (!folio_shares_mapping(folio,mapping) ||
 			    folio_test_writeback(folio))
 				goto unlock;
@@ -2188,7 +2216,9 @@ unlock:
 put:
 		folio_put(folio);
 	}
+done:
 	rcu_read_unlock();
+
 
 	if (folio_batch_count(fbatch)) {
 		unsigned long nr = 1;
