@@ -27,7 +27,7 @@
 #define NUM_PAGES     8
 #define FILE_A        "del_read_a.dat"
 #define FILE_B        "del_read_b.dat"
-#define SCANNER_WAIT  20
+#define SCANNER_WAIT  5
 
 int main(void)
 {

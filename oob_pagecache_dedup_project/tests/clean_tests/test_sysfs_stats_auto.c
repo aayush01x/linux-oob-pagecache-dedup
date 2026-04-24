@@ -19,7 +19,7 @@
 #define NUM_PAGES     16
 #define FILE1         "sysfs_stat_1.dat"
 #define FILE2         "sysfs_stat_2.dat"
-#define SCANNER_WAIT  20
+#define SCANNER_WAIT  5
 #define SYSFS_BASE    "/sys/kernel/oob_dedup/"
 
 static long read_sysfs_long(const char *attr)
