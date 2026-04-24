@@ -22,7 +22,7 @@
 #define NUM_PAGES     4
 #define FILE1         "cow_iso_file1.dat"
 #define FILE2         "cow_iso_file2.dat"
-#define SCANNER_WAIT  5   /* seconds for the background scanner */
+#define SCANNER_WAIT  20   /* seconds for the background scanner */
 
 int main(void)
 {

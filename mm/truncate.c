@@ -413,11 +413,39 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	index = start;
 	while (index < end && find_lock_entries(mapping, &index, end - 1,
 			&fbatch, indices)) {
-		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
-		for (i = 0; i < folio_batch_count(&fbatch); i++){
+		bool has_dedup = false;
 
-			truncate_cleanup_folio(fbatch.folios[i]);}
-		delete_from_page_cache_batch(mapping, &fbatch);
+		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
+
+		/*
+		 * Check if any folio in this batch is deduped.  For intra-file
+		 * dedup the same physical folio sits at multiple XArray indices
+		 * in the same mapping, so page_cache_delete_batch (which matches
+		 * folios by physical identity) would remove the WRONG slot.
+		 * Handle such batches folio-by-folio with the correct index.
+		 */
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			if (folio_test_dedup(fbatch.folios[i])) {
+				has_dedup = true;
+				break;
+			}
+		}
+
+		for (i = 0; i < folio_batch_count(&fbatch); i++)
+			truncate_cleanup_folio(fbatch.folios[i]);
+
+		if (unlikely(has_dedup)) {
+			for (i = 0; i < folio_batch_count(&fbatch); i++) {
+				struct folio *f = fbatch.folios[i];
+				if (folio_test_dedup(f))
+					filemap_remove_folio_at(f, mapping,
+								indices[i]);
+				else
+					filemap_remove_folio(f);
+			}
+		} else {
+			delete_from_page_cache_batch(mapping, &fbatch);
+		}
 		for (i = 0; i < folio_batch_count(&fbatch); i++)
 			folio_unlock(fbatch.folios[i]);
 		folio_batch_release(&fbatch);
@@ -478,9 +506,29 @@ void truncate_inode_pages_range(struct address_space *mapping,
 				continue;
 
 			folio_lock(folio);
-			VM_BUG_ON_FOLIO(!folio_shares_index(folio, mapping, indices[i]), folio);
-			folio_wait_writeback(folio);
-			truncate_inode_folio(mapping, folio);
+
+			if (unlikely(folio_test_dedup(folio))) {
+				/*
+				 * Deduped folio: use index-aware removal.
+				 * truncate_inode_folio's fake-mapping trick
+				 * breaks for intra-file dedup because
+				 * page_cache_delete uses folio->index (wrong)
+				 * and then orphans the folio (mapping = NULL).
+				 */
+				if (folio_shares_index(folio, mapping,
+						       indices[i])) {
+					folio_wait_writeback(folio);
+					truncate_cleanup_folio(folio);
+					filemap_remove_folio_at(folio, mapping,
+								indices[i]);
+				}
+			} else {
+				VM_BUG_ON_FOLIO(!folio_shares_index(folio,
+					mapping, indices[i]), folio);
+				folio_wait_writeback(folio);
+				truncate_inode_folio(mapping, folio);
+			}
+
 			folio_unlock(folio);
 		}
 		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
@@ -488,6 +536,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	}
 }
 EXPORT_SYMBOL(truncate_inode_pages_range);
+
 
 /**
  * truncate_inode_pages - truncate *all* the pages from an offset

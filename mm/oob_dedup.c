@@ -335,22 +335,32 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                         pr_info("Could not deduplicate folio with err code = %d", err);
                     }
                 } else if (nr > 1 && matched * 100 >= nr * merge_threshold_pct) {
-                    pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
-                    folio_lock(folio);
-                    if (!split_folio(folio)) {
-                        atomic_inc(&stat_folios_split);
-                        pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
-                                index);
-                        /*
-                         * Rewind the scanner cursor back to this folio's
-                         * base index so the split (now order-0) pages are
-                         * re-encountered on the very next pass
-                         */
-                        oob_scan.pgoff = index;
+                    /*
+                     * Cannot split a deduped folio: its folio->mapping is a
+                     * tagged pointer to oob_dedup_info, not a real
+                     * address_space.  split_huge_page_to_list() dereferences
+                     * folio->mapping->i_mmap_rwsem which would NULL-deref.
+                     */
+                    if (folio_test_dedup(folio)) {
+                        pr_debug("Skipping split of already-deduped folio at pgoff %lu\n", index);
                     } else {
-                        pr_debug("Failed to split large folio.\n");
+                        pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
+                        folio_lock(folio);
+                        if (!split_folio(folio)) {
+                            atomic_inc(&stat_folios_split);
+                            pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
+                                    index);
+                            /*
+                             * Rewind the scanner cursor back to this folio's
+                             * base index so the split (now order-0) pages are
+                             * re-encountered on the very next pass
+                             */
+                            oob_scan.pgoff = index;
+                        } else {
+                            pr_debug("Failed to split large folio.\n");
+                        }
+                        folio_unlock(folio);
                     }
-                    folio_unlock(folio);
                 }
             } else {
                 // struct folio *larger_folio = folio_order(orig_folio) > folio_order(folio) ? orig_folio : folio;
@@ -461,6 +471,20 @@ static void oob_dedup_do_scan(void)
             if (!IS_ERR(folio)) {
                 long nr = folio_nr_pages(folio);
                 pgoff_t folio_start = folio_index(folio);
+
+                /*
+                 * Skip folios that are already deduped — their mapping
+                 * pointer is tagged and must not be passed to code that
+                 * dereferences it as a plain address_space*.
+                 */
+                if (folio_test_dedup(folio)) {
+                    folio_put(folio);
+                    oob_scan.pgoff = folio_start + nr;
+                    slot_pages_done += nr;
+                    pages_done += nr;
+                    atomic_add(nr, &stat_pages_scanned);
+                    continue;
+                }
 
                 /*
                  * Snapshot the cursor before the call so we can detect
