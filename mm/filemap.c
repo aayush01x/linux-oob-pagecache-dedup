@@ -130,6 +130,7 @@ static void page_cache_delete(struct address_space *mapping,
   pgoff_t f_index = folio_index_in(folio, mapping);
   XA_STATE(xas, &mapping->i_pages, f_index);
 	long nr = 1;
+	bool was_dedup;
 
 	mapping_set_update(&xas, mapping);
 
@@ -144,15 +145,16 @@ static void page_cache_delete(struct address_space *mapping,
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
 
-	if (folio_test_dedup(folio)) {
+	was_dedup = folio_test_dedup(folio);
+	if (was_dedup) {
 		oob_dedup_disconnect_folio(folio, mapping, f_index);
+	} else {
+		folio->mapping = NULL;
 	}
-	if (!folio_test_dedup(folio)) {
-    folio->mapping = NULL;
-  }
 	/* Leave page->index set: truncation lookup relies upon it */
 	mapping->nrpages -= nr;
 }
+
 
 static void filemap_unaccount_folio(struct address_space *mapping,
 		struct folio *folio)
@@ -270,6 +272,7 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	long nr = 1;
+	bool was_dedup;
 
 	BUG_ON(!folio_test_locked(folio));
 
@@ -293,10 +296,18 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 		xas_init_marks(&xas);
 	}
 
-	if (folio_test_dedup(folio))
-		oob_dedup_disconnect_folio(folio, mapping, index);
+	/*
+	 * Snapshot the dedup state BEFORE disconnect, because disconnect
+	 * may dissolve the dedup (rmap_count drops to 1) and restore
+	 * folio->mapping to the surviving owner's mapping. We must NOT
+	 * clear folio->mapping in that case — the folio is still live
+	 * in the survivor's XArray.
+	 */
+	was_dedup = folio_test_dedup(folio);
 
-	if (!folio_test_dedup(folio))
+	if (was_dedup)
+		oob_dedup_disconnect_folio(folio, mapping, index);
+	else
 		folio->mapping = NULL;
 
 	mapping->nrpages -= nr;
@@ -308,6 +319,7 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 
 	filemap_free_folio(mapping, folio);
 }
+
 
 /**
  * filemap_remove_folio - Remove folio from page cache.
