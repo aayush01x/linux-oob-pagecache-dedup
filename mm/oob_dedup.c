@@ -114,6 +114,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 {
     struct oob_dedup_info *info = NULL, *new_info = NULL;
     struct oob_dedup_rmap_entry *orig_entry = NULL, *dup_entry = NULL;
+    struct address_space *saved_mapping = NULL;
+    pgoff_t saved_index = 0;
     pgoff_t base_index = (index >> folio_order(dup_folio)) << folio_order(dup_folio);
 
     XA_STATE(xas, &mapping->i_pages, base_index);
@@ -192,8 +194,10 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         spin_lock_init(&info->lock);
         INIT_LIST_HEAD(&info->rmap_list);
         
-        orig_entry->mapping = orig_folio->mapping;
-        orig_entry->index = orig_folio->index;
+        saved_mapping = orig_folio->mapping;
+        saved_index = orig_folio->index;
+        orig_entry->mapping = saved_mapping;
+        orig_entry->index = saved_index;
         list_add(&orig_entry->list, &info->rmap_list);
         info->rmap_count = 1;
         
@@ -232,10 +236,14 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         spin_unlock(&info->lock);
         
         if (dissolve_needed){
-			orig_folio->mapping = orig_entry->mapping;
-			orig_folio->index = orig_entry->index;
+			struct oob_dedup_rmap_entry *last_entry =
+				list_first_entry(&info->rmap_list,
+					struct oob_dedup_rmap_entry, list);
+			orig_folio->mapping = saved_mapping;
+			orig_folio->index = saved_index;
 			
-			kmem_cache_free(rmap_entry_cache, orig_entry);
+			list_del(&last_entry->list);
+			kmem_cache_free(rmap_entry_cache, last_entry);
 			kmem_cache_free(dedup_info_cache, info);
 		}
         
