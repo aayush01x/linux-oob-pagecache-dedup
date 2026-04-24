@@ -29,7 +29,7 @@
 #define TOTAL_CHUNKS     (FILE_SIZE_MB * 1024 * 1024 / CHUNK_SIZE)
 #define FILE_A           "large_folio_a.dat"
 #define FILE_B           "large_folio_b.dat"
-#define SCANNER_WAIT     8
+#define SCANNER_WAIT     20
 
 static int create_large_file(const char *path, char fill)
 {

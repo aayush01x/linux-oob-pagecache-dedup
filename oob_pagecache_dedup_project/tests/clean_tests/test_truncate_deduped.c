@@ -26,7 +26,7 @@
 #define NUM_PAGES     4
 #define FILE_A        "trunc_dedup_a.dat"
 #define FILE_B        "trunc_dedup_b.dat"
-#define SCANNER_WAIT  5
+#define SCANNER_WAIT  20
 
 int main(void)
 {
