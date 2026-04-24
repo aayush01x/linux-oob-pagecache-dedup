@@ -478,7 +478,8 @@ static int oob_dedup_thread_fn(void *nothing)
  * see page_cache_delete in mm/filemap.c for more info 
  *
  * */
-void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping)
+void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mapping,
+                                pgoff_t index)
 {
   struct oob_dedup_info *info = folio_dedup_info(folio);
   struct oob_dedup_rmap_entry *entry, *tmp;
@@ -488,7 +489,12 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
     // since the ancestor? function holds irqsave(non interruptible lock) we need to keep using irqsave locks
     spin_lock_irqsave(&info->lock, flags);
     list_for_each_entry_safe(entry, tmp, &info->rmap_list, list) {
-        if (entry->mapping == mapping) {
+        /*
+         * Match on both mapping AND index. For intra-file dedup, all rmap
+         * entries share the same mapping, so matching on mapping alone would
+         * remove the wrong entry and desync the rmap list from the XArray.
+         */
+        if (entry->mapping == mapping && entry->index == index) {
             list_del(&entry->list);
             info->rmap_count--;
             kmem_cache_free(rmap_entry_cache, entry);
@@ -500,16 +506,35 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
     if (info->rmap_count == 1) {
         struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
                                            struct oob_dedup_rmap_entry, list);
+        /*
+         * Intra-file dedup fix: if the remaining rmap entry belongs to the
+         * SAME mapping we are disconnecting from, the folio is still present
+         * at the other XArray slot (last->index). We must remove it now,
+         * otherwise truncate_inode_pages_range will rediscover it endlessly.
+         * The caller holds xa_lock_irq(&mapping->i_pages) so this is safe.
+         */
+        if (last->mapping == mapping) {
+            XA_STATE(xas_other, &mapping->i_pages, last->index);
+            xas_set_order(&xas_other, last->index, folio_order(folio));
+            xas_store(&xas_other, NULL);
+            mapping->nrpages -= folio_nr_pages(folio);
+        }
         folio->mapping = last->mapping;
         folio->index = last->index;
         list_del(&last->list);
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
+    } else if (info->rmap_count == 0) {
+        /*
+         * All rmap entries removed — this shouldn't normally happen,
+         * but handle it gracefully to avoid leaking the info struct.
+         */
+        folio->mapping = NULL;
+        dissolve = true;
     }
 	spin_unlock_irqrestore(&info->lock, flags);
     if (dissolve){
         kmem_cache_free(dedup_info_cache, info);
-   
         }
 }
 

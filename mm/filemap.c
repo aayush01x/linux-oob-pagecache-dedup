@@ -144,6 +144,9 @@ static void page_cache_delete(struct address_space *mapping,
 	xas_store(&xas, shadow);
 	xas_init_marks(&xas);
 
+	if (folio_test_dedup(folio)) {
+		oob_dedup_disconnect_folio(folio, mapping, f_index);
+	}
 	if (!folio_test_dedup(folio)) {
     folio->mapping = NULL;
   }
@@ -225,9 +228,11 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	struct address_space *mapping = folio->mapping;
 
 	trace_mm_filemap_delete_from_page_cache(folio);
-	if (unlikely(folio_test_dedup(folio))) {
-		oob_dedup_disconnect_folio(folio, mapping);
-	}
+	/*
+	 * For deduped folios, disconnect is handled inside page_cache_delete()
+	 * (single path) or page_cache_delete_batch() (batch path) where
+	 * the correct XArray index is known.
+	 */
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }
@@ -341,7 +346,7 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
 		if (folio_test_dedup(folio)) {
-        oob_dedup_disconnect_folio(folio, mapping);
+        oob_dedup_disconnect_folio(folio, mapping, xas.xa_index);
     } else {
         folio->mapping = NULL;
     }
