@@ -277,10 +277,8 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
 
-    pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount before put = %d\n",
-        folio_pfn(dup_folio),folio_ref_count(dup_folio));
-    /* Drop the scanner's filemap_get_folio reference */
-    folio_put(dup_folio);
+    pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount after dedup = %d \n",
+        folio_pfn(dup_folio), folio_ref_count(dup_folio));
 
     atomic_inc(&stat_pages_deduped);
     return 0;
