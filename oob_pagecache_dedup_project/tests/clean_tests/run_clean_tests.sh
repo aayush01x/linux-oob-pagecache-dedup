@@ -9,6 +9,20 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Run tests on XFS for large folio support (faster truncation of deduped files).
+# XFS creates order-4 folios (64KB) which dramatically reduces rmap list sizes.
+# Override: TEST_WORKDIR=/your/path bash run_clean_tests.sh
+if [ -z "$TEST_WORKDIR" ]; then
+    XFS_MOUNT=$(findmnt -t xfs -n -o TARGET | head -1)
+    TEST_WORKDIR="${XFS_MOUNT:-$SCRIPT_DIR}"
+fi
+if [ ! -d "$TEST_WORKDIR" ]; then
+    echo "[!] $TEST_WORKDIR does not exist. Falling back to script directory."
+    TEST_WORKDIR="$SCRIPT_DIR"
+fi
+
+# Compile in source dir, run tests in XFS workdir
 cd "$SCRIPT_DIR"
 
 PASS=0
@@ -17,11 +31,13 @@ SKIP=0
 
 # ---------- helpers ----------
 cleanup_all() {
+    cd "$TEST_WORKDIR"
     rm -f cow_iso_file*.dat trunc_dedup_*.dat del_read_*.dat \
           sysfs_stat_*.dat fanout_*.dat large_folio_*.dat \
           intra_dedup_stress.dat cascade_*.dat \
           conc_tc_*.dat rededup_*.dat torture_*.dat \
           parttrunc_*.dat nfp_*.dat rapid_*.dat cowtrunc_*.dat
+    cd "$SCRIPT_DIR"
 }
 
 compile() {
@@ -29,7 +45,7 @@ compile() {
     local bin="${src%.c}"
     local extra="$2"
     echo "  Compiling $src ..."
-    gcc -Wall -Wextra -O2 -o "$bin" "$src" $extra
+    gcc -Wall -Wextra -O2 -o "$TEST_WORKDIR/$bin" "$src" $extra
 }
 
 run_one() {
@@ -44,12 +60,14 @@ run_one() {
     sync
     sleep 1
 
+    cd "$TEST_WORKDIR"
     if sudo "./$bin"; then
         PASS=$((PASS + 1))
     else
         echo "  *** FAILED ***"
         FAIL=$((FAIL + 1))
     fi
+    cd "$SCRIPT_DIR"
 
     sleep 1
 }
@@ -117,12 +135,14 @@ echo "  SKIPPED: $SKIP"
 echo "========================================"
 
 # Clean up binaries
+cd "$TEST_WORKDIR"
 rm -f test_cow_isolation_auto test_truncate_deduped test_delete_then_read \
       test_sysfs_stats_auto test_fanout_cow test_large_folio \
       test_intra_file_dedup test_cascade_unlink test_concurrent_trunc_cow \
       test_rededup_after_cow test_mixed_ops_torture \
       test_partial_truncate_dedup \
       test_nr_file_pages_leak test_rapid_dedup_delete test_cow_during_truncate
+cd "$SCRIPT_DIR"
 
 if [ "$FAIL" -gt 0 ]; then
     echo "SOME TESTS FAILED"

@@ -10,7 +10,12 @@
 
 set -e
 
-TEST_DIR="/mnt/test_large"
+# Prefer XFS for large folio support (faster truncation of deduped files).
+# Override: TEST_DIR=/your/path sudo bash test_large_file_dedup.sh
+if [ -z "$TEST_DIR" ]; then
+    XFS_MOUNT=$(findmnt -t xfs -n -o TARGET | head -1)
+    TEST_DIR="${XFS_MOUNT:-/tmp}/dedup_test"
+fi
 NUM_FILES=3
 FILE_SIZE_MB=32   # 32 MB per file → 96 MB total
 FILL_CHAR="X"

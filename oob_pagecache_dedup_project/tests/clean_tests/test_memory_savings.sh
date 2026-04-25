@@ -3,7 +3,12 @@
 # Run this on the VM while watching /proc/meminfo in another terminal
 
 set -e
-TEST_DIR="/mnt/test"
+# Prefer XFS for large folio support (faster truncation of deduped files).
+# Override: TEST_DIR=/your/path sudo bash test_memory_savings.sh
+if [ -z "$TEST_DIR" ]; then
+    XFS_MOUNT=$(findmnt -t xfs -n -o TARGET | head -1)
+    TEST_DIR="${XFS_MOUNT:-/tmp}/dedup_test"
+fi
 NUM_FILES=10
 FILE_SIZE_MB=20  # Each file = 20 MB, total = 200 MB of identical data
 FILL_CHAR="A"
