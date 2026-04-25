@@ -2583,13 +2583,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
 			break;
 		if (folio_test_readahead(folio))
 			break;
-		/*
-		 * OOB dedup fix: folio_next_index() uses folio->index which
-		 * for deduped folios is the base file's index, not ours.
-		 * Use xas.xa_index (the XArray slot we actually found) to
-		 * advance correctly.
-		 */
-		xas_advance(&xas, xas.xa_index + folio_nr_pages(folio) - 1);
+		xas_advance(&xas, folio_next_index(folio) - 1);
 		continue;
 put_folio:
 		folio_put(folio);
