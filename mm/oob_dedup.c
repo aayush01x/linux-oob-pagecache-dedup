@@ -259,6 +259,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     if (folio_test_pmd_mappable(orig_folio))
         lruvec_stat_mod_folio(orig_folio, NR_FILE_THPS, folio_nr_pages(orig_folio));
 
+
 #ifdef CONFIG_MEMCG
     if (dup_folio->memcg_data) {
         mem_cgroup_uncharge(dup_folio);

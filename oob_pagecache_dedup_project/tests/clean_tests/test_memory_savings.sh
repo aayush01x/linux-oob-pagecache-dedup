@@ -34,12 +34,20 @@ for i in $(seq 1 $NUM_FILES); do
     echo "  Created dedup_test_$i.dat"
 done
 
-# Flush all dirty pages to disk so folios are clean for dedup
-echo "[*] Syncing to flush dirty pages..."
+# Flush dirty pages AND release buffer_heads:
+# sync writes data to disk, drop_caches releases buffer_heads & page cache
+echo "[*] Syncing + dropping caches to release buffer_heads..."
 sync
+echo 3 > /proc/sys/vm/drop_caches
 sleep 2
 
-# Now queue for dedup (after sync so pages are clean)
+# Re-read files into page cache (now clean, no buffer_heads)
+echo "[2] Reading all files into clean page cache..."
+for i in $(seq 1 $NUM_FILES); do
+    cat "dedup_test_$i.dat" > /dev/null
+done
+
+# Queue for dedup AFTER clean read
 echo "[*] Queueing files for dedup..."
 for i in $(seq 1 $NUM_FILES); do
     python3 -c "
@@ -51,12 +59,6 @@ libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DEDUP)
 os.close(fd)
 " 2>/dev/null || true
     echo "  [+] Queued dedup_test_$i.dat"
-done
-
-# Force files into page cache by reading them
-echo "[2] Reading all files into page cache..."
-for i in $(seq 1 $NUM_FILES); do
-    cat "dedup_test_$i.dat" > /dev/null
 done
 
 sleep 2
