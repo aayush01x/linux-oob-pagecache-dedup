@@ -34,6 +34,7 @@ static struct kmem_cache *dedup_info_cache;
 static unsigned int sleep_millisecs = 20;
 static unsigned int pages_to_scan = 4096;
 #define MAX_PAGES_PER_FILE 1048576
+#define MAX_ANCHORS 8		/* CPU safety cap for anchor count */
 
 /* sysfs kobject and counters for the sysfs layer */
 static struct kobject *oob_dedup_kobj;
@@ -56,7 +57,9 @@ static DEFINE_HASHTABLE(oob_folio_hash, 12);
 
 
 
-static u32 hash_folio(struct folio *folio)
+/* Legacy: full-folio hash, superseded by anchor hashing.
+ * Kept for reference and debugging. */
+static u32 __maybe_unused hash_folio(struct folio *folio)
 {
 	void *addr;
 	u32 hash = ~0;
@@ -69,6 +72,81 @@ static u32 hash_folio(struct folio *folio)
 	}
 
 	return hash;
+}
+
+/*
+ * Hash a single page within a folio at a specific page offset.
+ * Used by the anchor sampling algorithm.
+ */
+static u32 hash_page_at(struct folio *folio, unsigned int page_idx)
+{
+	void *addr;
+	u32 hash;
+
+	addr = kmap_local_folio(folio, (unsigned long)page_idx * PAGE_SIZE);
+	hash = crc32_le(~0, addr, PAGE_SIZE);
+	kunmap_local(addr);
+	return hash;
+}
+
+/*
+ * Phase 2: Zero-page short circuit.
+ * Returns true if the first page of the folio is entirely zeros.
+ */
+static bool folio_first_page_is_zero(struct folio *folio)
+{
+	void *addr;
+	bool is_zero;
+
+	addr = kmap_local_folio(folio, 0);
+	is_zero = (memchr_inv(addr, 0, PAGE_SIZE) == NULL);
+	kunmap_local(addr);
+	return is_zero;
+}
+
+/*
+ * Phase 3: Dynamic anchor geometry.
+ * Computes stride, anchor count, and evasion offset from the
+ * merge_threshold_pct tunable and the folio's page count.
+ */
+struct anchor_geometry {
+	unsigned int stride;		/* minimum contiguous match size */
+	unsigned int anchor_count;	/* number of anchors to drop */
+	unsigned int evasion_off;	/* odd offset to skip headers */
+};
+
+static struct anchor_geometry compute_anchor_geometry(unsigned int nr_pages)
+{
+	struct anchor_geometry geo;
+
+	geo.stride = (nr_pages * merge_threshold_pct) / 100;
+	if (geo.stride == 0)
+		geo.stride = 1;
+
+	geo.anchor_count = nr_pages / geo.stride;
+
+	/* CPU safety cap */
+	if (geo.anchor_count > MAX_ANCHORS) {
+		geo.anchor_count = MAX_ANCHORS;
+		geo.stride = nr_pages / (geo.anchor_count + 1);
+		if (geo.stride == 0)
+			geo.stride = 1;
+	}
+
+	/* At least 1 anchor */
+	if (geo.anchor_count == 0)
+		geo.anchor_count = 1;
+
+	/* Evasion offset: half-stride, forced odd */
+	geo.evasion_off = geo.stride / 2;
+	if ((geo.evasion_off & 1) == 0)
+		geo.evasion_off |= 1;
+
+	/* Clamp: evasion offset must not push anchors beyond nr_pages */
+	if (geo.evasion_off >= nr_pages)
+		geo.evasion_off = 0;
+
+	return geo;
 }
 
 static unsigned int compare_folios_count(struct folio *f1, struct folio *f2)
@@ -305,111 +383,159 @@ out_free:
 }
 
 static void check_and_store_folio(struct folio *folio, struct address_space *mapping, pgoff_t index)
-{   
+{
     struct page_entry *entry;
     struct hlist_node *tmp;
     bool found = false;
     int err = 1;
-    u32 hash = hash_folio(folio);
+    long nr = folio_nr_pages(folio);
+    unsigned int i;
 
-    spin_lock(&folio_hash_lock);
-    hash_for_each_possible_safe(oob_folio_hash, entry, tmp, node, hash) {
-        if (entry->hash != hash)
-            continue;
-        if (entry->mapping == mapping && entry->index == index)
-            continue;
+    /* Phase 3: compute anchor geometry */
+    struct anchor_geometry geo;
+    unsigned int n_anchors;
+    u32 anchor_hashes[MAX_ANCHORS];
+    unsigned int anchor_positions[MAX_ANCHORS];
 
-        struct address_space *entry_mapping = entry->mapping;
-        pgoff_t entry_index = entry->index;
-        spin_unlock(&folio_hash_lock);
+    if (nr <= 1) {
+        /* Order-0 folio: single page, degenerate to full-page hash */
+        n_anchors = 1;
+        anchor_hashes[0] = hash_page_at(folio, 0);
+        anchor_positions[0] = 0;
+        pr_info("OOB_DEDUP: [ANCHOR] order-0 folio at index %lu, hash=0x%08x\n",
+                index, anchor_hashes[0]);
+    } else {
+        geo = compute_anchor_geometry(nr);
+        n_anchors = geo.anchor_count;
 
-        struct folio *orig_folio = filemap_get_folio(entry_mapping, entry_index);
+        pr_info("OOB_DEDUP: [ANCHOR] large folio order=%u nr_pages=%lu at index %lu | "
+                "stride=%u count=%u evasion=%u\n",
+                folio_order(folio), nr, index,
+                geo.stride, geo.anchor_count, geo.evasion_off);
 
-        if (!IS_ERR(orig_folio)) {
-            if (orig_folio == folio) {
-                pr_debug("Folios already share physical memory. Skipping.\n");
-                folio_put(orig_folio);
-                spin_lock(&folio_hash_lock);
-                found = true;
-                break;
-            }
-
-            if (folio_order(orig_folio) == folio_order(folio)) {
-                long nr = folio_nr_pages(folio);
-                unsigned int matched = compare_folios_count(orig_folio, folio);
-
-                if (matched == nr) {
-                    pr_info("Exact duplicate verified!\n");
-                    pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu) | Order: %d\n",
-                             entry_mapping->host->i_ino, entry_index,
-                             mapping->host->i_ino, index, folio_order(folio));
-                    err = deduplicate_folio(orig_folio, folio, mapping, index);
-                    if (err == 0) {
-                        pr_info("Folio deduped successfully\n");
-                        found = true;
-                    } else {
-                        pr_info("Could not deduplicate folio with err code = %d", err);
-                    }
-                } else if (nr > 1 && matched * 100 >= nr * merge_threshold_pct) {
-                    /*
-                     * Cannot split a deduped folio: its folio->mapping is a
-                     * tagged pointer to oob_dedup_info, not a real
-                     * address_space.  split_huge_page_to_list() dereferences
-                     * folio->mapping->i_mmap_rwsem which would NULL-deref.
-                     */
-                    if (folio_test_dedup(folio)) {
-                        pr_debug("Skipping split of already-deduped folio at pgoff %lu\n", index);
-                    } else {
-                        pr_info("Partial match >= threshold (%u/%lu). Splitting large folio.\n", matched, nr);
-                        folio_lock(folio);
-                        if (!split_folio(folio)) {
-                            atomic_inc(&stat_folios_split);
-                            pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
-                                    index);
-                            /*
-                             * Note: per-slot pgoff tracking means this
-                             * rewind is handled by the scanner not advancing
-                             * past the folio when split is detected.
-                             */
-                        } else {
-                            pr_debug("Failed to split large folio.\n");
-                        }
-                        folio_unlock(folio);
-                    }
-                }
-            } else {
-                // struct folio *larger_folio = folio_order(orig_folio) > folio_order(folio) ? orig_folio : folio;
-                // folio_lock(larger_folio);
-                // if (!split_folio(larger_folio)) {
-                //     atomic_inc(&stat_folios_split);
-                //     pr_info("Successfully split a different-ordered large folio.\n");
-                // }
-                // folio_unlock(larger_folio);
-            }
-            folio_put(orig_folio);
-        } else {
-            spin_lock(&folio_hash_lock);
-            pr_debug("Stale hash entry detected for Inode %lu. Removing.\n", entry_mapping->host->i_ino);
-            hash_del(&entry->node);
-            kfree(entry);
-            spin_unlock(&folio_hash_lock);
+        for (i = 0; i < n_anchors; i++) {
+            unsigned int pos = geo.evasion_off + i * geo.stride;
+            if (pos >= nr)
+                pos = nr - 1;  /* clamp to last page */
+            anchor_positions[i] = pos;
+            anchor_hashes[i] = hash_page_at(folio, pos);
+            pr_info("OOB_DEDUP: [ANCHOR]   anchor[%u] page=%u hash=0x%08x\n",
+                    i, pos, anchor_hashes[i]);
         }
+    }
+
+    /*
+     * For each anchor hash, search the hash table for a candidate.
+     * On the FIRST hit, fetch the candidate folio and do a full
+     * page-by-page comparison. This uses anchors purely as a
+     * cheap pre-filter (two-level scheme).
+     */
+    for (i = 0; i < n_anchors && !found; i++) {
+        u32 hash = anchor_hashes[i];
+        pr_info("OOB_DEDUP: [ANCHOR] searching hash table for anchor[%u] hash=0x%08x\n",
+                i, hash);
 
         spin_lock(&folio_hash_lock);
-        if (found)
-            break;
+        hash_for_each_possible_safe(oob_folio_hash, entry, tmp, node, hash) {
+            if (entry->hash != hash)
+                continue;
+            /* Skip self-matches: same folio, same anchor position */
+            if (entry->mapping == mapping && entry->index == index)
+                continue;
+
+            struct address_space *entry_mapping = entry->mapping;
+            pgoff_t entry_index = entry->index;
+            spin_unlock(&folio_hash_lock);
+
+            struct folio *orig_folio = filemap_get_folio(entry_mapping, entry_index);
+
+            if (!IS_ERR(orig_folio)) {
+                if (orig_folio == folio) {
+                    pr_debug("Folios already share physical memory. Skipping.\n");
+                    folio_put(orig_folio);
+                    spin_lock(&folio_hash_lock);
+                    found = true;
+                    break;
+                }
+
+                if (folio_order(orig_folio) == folio_order(folio)) {
+                    unsigned int matched = compare_folios_count(orig_folio, folio);
+                    pr_info("OOB_DEDUP: [ANCHOR] anchor[%u] HIT! candidate inode %lu index %lu | "
+                            "full compare: %u/%lu pages match\n",
+                            i, entry_mapping->host->i_ino, entry_index, matched, nr);
+
+                    if (matched == nr) {
+                        pr_info("Exact duplicate verified! (anchor %u hit)\n", i);
+                        pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu) | Order: %d\n",
+                                 entry_mapping->host->i_ino, entry_index,
+                                 mapping->host->i_ino, index, folio_order(folio));
+                        err = deduplicate_folio(orig_folio, folio, mapping, index);
+                        if (err == 0) {
+                            pr_info("Folio deduped successfully\n");
+                            found = true;
+                        } else {
+                            pr_info("Could not deduplicate folio with err code = %d", err);
+                        }
+                    } else if (nr > 1 && matched * 100 >= nr * merge_threshold_pct) {
+                        /*
+                         * Cannot split a deduped folio: its folio->mapping is a
+                         * tagged pointer to oob_dedup_info, not a real
+                         * address_space.  split_huge_page_to_list() dereferences
+                         * folio->mapping->i_mmap_rwsem which would NULL-deref.
+                         */
+                        if (folio_test_dedup(folio)) {
+                            pr_debug("Skipping split of already-deduped folio at pgoff %lu\n", index);
+                        } else {
+                            pr_info("Partial match >= threshold (%u/%lu) via anchor %u. Splitting.\n",
+                                     matched, nr, i);
+                            folio_lock(folio);
+                            if (!split_folio(folio)) {
+                                atomic_inc(&stat_folios_split);
+                                pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
+                                        index);
+                            } else {
+                                pr_debug("Failed to split large folio.\n");
+                            }
+                            folio_unlock(folio);
+                        }
+                    }
+                }
+                folio_put(orig_folio);
+            } else {
+                spin_lock(&folio_hash_lock);
+                pr_debug("Stale hash entry detected for Inode %lu. Removing.\n", entry_mapping->host->i_ino);
+                hash_del(&entry->node);
+                kfree(entry);
+                spin_unlock(&folio_hash_lock);
+            }
+
+            spin_lock(&folio_hash_lock);
+            if (found)
+                break;
+        }
+        spin_unlock(&folio_hash_lock);
     }
 
+    /*
+     * No anchor matched any existing entry — store all anchors
+     * so future folios can match against this one.
+     */
     if (!found) {
-        entry = kmalloc(sizeof(struct page_entry), GFP_ATOMIC);
-        if (entry) {
-            entry->hash = hash;
-            entry->mapping = mapping;
-            entry->index = index;
-            hash_add(oob_folio_hash, &entry->node, hash);
+        pr_info("OOB_DEDUP: [ANCHOR] no match for inode %lu index %lu — storing %u anchor entries\n",
+                mapping->host->i_ino, index, n_anchors);
+        spin_lock(&folio_hash_lock);
+        for (i = 0; i < n_anchors; i++) {
+            entry = kmalloc(sizeof(struct page_entry), GFP_ATOMIC);
+            if (entry) {
+                entry->hash = anchor_hashes[i];
+                entry->mapping = mapping;
+                entry->index = index;
+                entry->anchor_idx = anchor_positions[i];
+                hash_add(oob_folio_hash, &entry->node, anchor_hashes[i]);
+            }
         }
+        spin_unlock(&folio_hash_lock);
     }
-    spin_unlock(&folio_hash_lock);
 }
 
 static void oob_dedup_do_scan(void)
@@ -493,6 +619,37 @@ static void oob_dedup_do_scan(void)
                  * dereferences it as a plain address_space*.
                  */
                 if (folio_test_dedup(folio)) {
+                    folio_put(folio);
+                    slot->pgoff = folio_start + nr;
+                    slot_pages_done += nr;
+                    pages_done += nr;
+                    atomic_add(nr, &stat_pages_scanned);
+                    continue;
+                }
+
+                /*
+                 * Phase 1: I/O Veto — skip folios under active I/O.
+                 * Do NOT advance cursor so scanner retries next round.
+                 */
+                if (folio_test_dirty(folio) ||
+                    folio_test_writeback(folio)) {
+                    pr_info("OOB_DEDUP: [VETO] skipping dirty/writeback folio at pgoff %lu (nr=%lu), will retry\n",
+                            folio_start, nr);
+                    folio_put(folio);
+                    slot_pages_done += nr;
+                    pages_done += nr;
+                    atomic_add(nr, &stat_pages_scanned);
+                    continue;
+                }
+
+                /*
+                 * Phase 2: Zero-page short circuit — skip folios whose
+                 * first page is entirely zeros to prevent hash table
+                 * hot-bucket pathology.
+                 */
+                if (folio_first_page_is_zero(folio)) {
+                    pr_info("OOB_DEDUP: [ZERO] skipping all-zero folio at pgoff %lu (nr=%lu)\n",
+                            folio_start, nr);
                     folio_put(folio);
                     slot->pgoff = folio_start + nr;
                     slot_pages_done += nr;

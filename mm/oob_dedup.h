@@ -13,6 +13,7 @@ struct page_entry {
     u32 hash;
     struct address_space *mapping;
     pgoff_t index;
+    unsigned int anchor_idx;    /* which anchor position (0..N-1) */
     struct hlist_node node;
 };
 
