@@ -250,6 +250,12 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     folio_put_refs(dup_folio, folio_nr_pages(dup_folio));
 
     lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
+    if (folio_test_pmd_mappable(dup_folio))
+        lruvec_stat_mod_folio(dup_folio, NR_FILE_THPS, -folio_nr_pages(dup_folio));
+
+    lruvec_stat_mod_folio(orig_folio, NR_FILE_PAGES, folio_nr_pages(orig_folio));
+    if (folio_test_pmd_mappable(orig_folio))
+        lruvec_stat_mod_folio(orig_folio, NR_FILE_THPS, folio_nr_pages(orig_folio));
 
 #ifdef CONFIG_MEMCG
     if (dup_folio->memcg_data) {
@@ -1045,11 +1051,7 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         return err;
     }
 #endif
-    __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
-    if (folio_test_large(new_folio)){
-		pr_info("OOB_DEDUP: i have a large folio\n");
-    __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
-}
+
     new_folio->mapping = mapping;
     new_folio->index = index;
     // copy the folio and data
@@ -1089,6 +1091,14 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         folio_put(new_folio);
         return xas_error(&xas);
     }else {
+        __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
+        if (folio_test_pmd_mappable(new_folio))
+            __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
+
+        __lruvec_stat_mod_folio(old_folio, NR_FILE_PAGES, -folio_nr_pages(old_folio));
+        if (folio_test_pmd_mappable(old_folio))
+            __lruvec_stat_mod_folio(old_folio, NR_FILE_THPS, -folio_nr_pages(old_folio));
+
         /* VERIFICATION BLOCK */
         struct folio *check_folio = xas_load(&xas); 
         unsigned long check_pfn = check_folio ? folio_pfn(check_folio) : 0;
