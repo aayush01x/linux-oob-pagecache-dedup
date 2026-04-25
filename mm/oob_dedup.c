@@ -624,7 +624,16 @@ static void oob_dedup_do_scan(void)
                  */
                 if (folio_test_dedup(folio)) {
                     folio_put(folio);
-                    slot->pgoff = folio_start + nr;
+                    /*
+                     * Do NOT use folio_start (= folio_index) here.
+                     * For deduped folios, folio->index belongs to the
+                     * surviving rmap owner (e.g. the base file), not to
+                     * the file we are currently scanning.  Using it
+                     * would jump the cursor backwards, causing an
+                     * infinite loop.  Advance from the current slot
+                     * position instead.
+                     */
+                    slot->pgoff += nr;
                     slot_pages_done += nr;
                     pages_done += nr;
                     atomic_add(nr, &stat_pages_scanned);
