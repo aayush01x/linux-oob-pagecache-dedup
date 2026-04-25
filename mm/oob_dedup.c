@@ -131,14 +131,16 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         if (!new_info || !orig_entry) goto out_free;
     }
 
-    // aquire locks for the folios
+    // acquire locks for the folios — use trylock to avoid deadlocking
+    // with the writeback path (ext4_do_writepages -> mpage_prepare_extent_to_map)
     if (orig_folio < dup_folio) {
-        folio_lock(orig_folio);
-        folio_lock(dup_folio);
+        if (!folio_trylock(orig_folio)) { err = -EAGAIN; goto out_free; }
+        if (!folio_trylock(dup_folio))  { folio_unlock(orig_folio); err = -EAGAIN; goto out_free; }
     } else {
-        folio_lock(dup_folio);
-        folio_lock(orig_folio);
+        if (!folio_trylock(dup_folio))  { err = -EAGAIN; goto out_free; }
+        if (!folio_trylock(orig_folio)) { folio_unlock(dup_folio); err = -EAGAIN; goto out_free; }
     }
+
     
     /*
      * MUahahaha
