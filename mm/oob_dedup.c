@@ -613,6 +613,10 @@ static void oob_dedup_do_scan(void)
                 long nr = folio_nr_pages(folio);
                 pgoff_t folio_start = folio_index(folio);
 
+                pr_info("OOB_DEDUP: [SCAN] found folio at pgoff %lu, order=%u nr=%lu inode=%lu\n",
+                        folio_start, folio_order(folio), nr,
+                        slot_mapping->host->i_ino);
+
                 /*
                  * Skip folios that are already deduped — their mapping
                  * pointer is tagged and must not be passed to code that
@@ -683,6 +687,13 @@ static void oob_dedup_do_scan(void)
                 pages_done += nr;
                 atomic_add(nr, &stat_pages_scanned);
             } else {
+                /* Page not in cache — scanner skips silently.
+                 * Log once per slot to help diagnose empty-cache issues.
+                 */
+                if (slot_pages_done == 0)
+                    pr_info("OOB_DEDUP: [SCAN] cache miss at pgoff %lu for inode %lu "
+                            "(pages may not be in cache)\n",
+                            slot->pgoff, slot_mapping->host->i_ino);
                 slot->pgoff++;
                 slot_pages_done++;
                 pages_done++;

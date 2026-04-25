@@ -43,7 +43,7 @@
  * 2nd pass: dedup the now-order-0 pages              */
 #define SCANNER_WAIT     8
 
-static int create_file(const char *path, char fill)
+static int create_file_and_queue(const char *path, char fill)
 {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror(path); return -1; }
@@ -58,22 +58,33 @@ static int create_file(const char *path, char fill)
     }
     free(buf);
     fsync(fd);
-    close(fd);
-    return 0;
-}
 
-static int queue_for_dedup(const char *path)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror(path); return -1; }
-
+    /* Queue immediately while pages are still in cache from the write */
     int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_DEDUP);
     if (ret != 0) {
         fprintf(stderr, "  fadvise(%s): %s\n", path, strerror(ret));
         close(fd);
         return -1;
     }
-    printf("  [+] Queued: %s\n", path);
+    printf("  [+] Created & queued: %s\n", path);
+    close(fd);
+    return 0;
+}
+
+/*
+ * Read the entire file sequentially to warm the page cache.
+ * This ensures folios exist for the scanner to hash.
+ */
+static int read_file_into_cache(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror(path); return -1; }
+
+    char *buf = malloc(CHUNK_SIZE);
+    ssize_t nr;
+    while ((nr = read(fd, buf, CHUNK_SIZE)) > 0)
+        ; /* just pull pages into cache */
+    free(buf);
     close(fd);
     return 0;
 }
@@ -87,43 +98,56 @@ int main(void)
     printf("[*] File size: %d MB, diff page: %d (offset %ld)\n",
            FILE_SIZE_MB, DIFF_PAGE_IDX, DIFF_OFFSET);
 
-    /* --- 1. Create two identical files -------------------------------- */
-    printf("\n[*] Step 1: Creating two identical %d MB files...\n", FILE_SIZE_MB);
-    if (create_file(FILE_A, 'P') < 0) return 1;
-    printf("  -> %s created\n", FILE_A);
-    if (create_file(FILE_B, 'P') < 0) return 1;
-    printf("  -> %s created\n", FILE_B);
+    /* --- 1. Create file A (all 'P'), queue immediately ---------------- */
+    printf("\n[*] Step 1: Creating %s (all 'P')...\n", FILE_A);
+    if (create_file_and_queue(FILE_A, 'P') < 0) return 1;
 
-    /* --- 2. Make file_b differ by exactly 1 page ---------------------- */
-    printf("\n[*] Step 2: Writing 'X' to page %d of %s (making it differ)...\n",
-           DIFF_PAGE_IDX, FILE_B);
+    /* --- 2. Create file B (all 'P'), then modify page 7 --------------- */
+    printf("\n[*] Step 2: Creating %s, then modifying page %d...\n",
+           FILE_B, DIFF_PAGE_IDX);
 
-    int fd = open(FILE_B, O_RDWR);
-    if (fd < 0) { perror("open file_b"); return 1; }
+    /* Create as all 'P' first (but don't queue yet) */
+    {
+        int fd = open(FILE_B, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { perror(FILE_B); return 1; }
 
-    char diff_page[PAGE_SIZE];
-    memset(diff_page, 'X', PAGE_SIZE);
+        char *buf = malloc(CHUNK_SIZE);
+        memset(buf, 'P', CHUNK_SIZE);
+        for (int i = 0; i < TOTAL_CHUNKS; i++) {
+            if (write(fd, buf, CHUNK_SIZE) != CHUNK_SIZE) {
+                perror("write"); free(buf); close(fd); return 1;
+            }
+        }
+        free(buf);
+        fsync(fd);
 
-    if (lseek(fd, DIFF_OFFSET, SEEK_SET) < 0) {
-        perror("lseek"); close(fd); return 1;
+        /* Now modify page 7 */
+        char diff_page[PAGE_SIZE];
+        memset(diff_page, 'X', PAGE_SIZE);
+        if (lseek(fd, DIFF_OFFSET, SEEK_SET) < 0) {
+            perror("lseek"); close(fd); return 1;
+        }
+        if (write(fd, diff_page, PAGE_SIZE) != PAGE_SIZE) {
+            perror("write diff page"); close(fd); return 1;
+        }
+        fsync(fd);
+
+        /* Queue for dedup while pages are hot in cache */
+        int r = posix_fadvise(fd, 0, 0, POSIX_FADV_DEDUP);
+        if (r != 0) {
+            fprintf(stderr, "  fadvise(%s): %s\n", FILE_B, strerror(r));
+            close(fd); return 1;
+        }
+        printf("  [+] Created, modified page %d, & queued: %s\n",
+               DIFF_PAGE_IDX, FILE_B);
+        close(fd);
     }
-    if (write(fd, diff_page, PAGE_SIZE) != PAGE_SIZE) {
-        perror("write diff page"); close(fd); return 1;
-    }
-    fsync(fd);
-    close(fd);
-    printf("  -> Page %d of %s now contains 'X' (rest is 'P')\n",
-           DIFF_PAGE_IDX, FILE_B);
 
-    /* --- 3. Drop caches to ensure clean state, then queue ------------- */
-    printf("\n[*] Step 3: Dropping caches and queuing for dedup...\n");
-    sync();
-    FILE *dc = fopen("/proc/sys/vm/drop_caches", "w");
-    if (dc) { fprintf(dc, "3"); fclose(dc); }
-    sleep(1);
-
-    if (queue_for_dedup(FILE_A) < 0) { ret = 1; goto out; }
-    if (queue_for_dedup(FILE_B) < 0) { ret = 1; goto out; }
+    /* --- 3. Re-read both files to ensure pages are warm in cache ------ */
+    printf("\n[*] Step 3: Reading both files into page cache...\n");
+    read_file_into_cache(FILE_A);
+    read_file_into_cache(FILE_B);
+    printf("  -> Page cache warmed\n");
 
     /* --- 4. Wait for scanner ----------------------------------------- */
     printf("\n[*] Step 4: Waiting %ds for scanner (anchor detect + split + re-dedup)...\n",
