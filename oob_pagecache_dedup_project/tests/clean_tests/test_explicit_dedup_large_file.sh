@@ -15,7 +15,7 @@ if [ -z "$TEST_DIR" ]; then
   fi
 fi
 
-FILE_SIZE_MB=200
+FILE_SIZE_MB=512
 FILENAME="large_dedup_512.dat"
 
 mkdir -p "$TEST_DIR"
@@ -111,31 +111,23 @@ echo "  Before load:   $NR_FILE_BEFORE"
 echo "  After load:    $NR_FILE_LOADED"
 echo "  After dedup:   $NR_FILE_AFTER"
 
-# After intra-file dedup, all identical pages collapse to 1 folio.
-# nr_file_pages should drop by roughly (loaded_pages - 1_folio).
-# We compare the DELTA rather than absolute value, since baseline
-# pages may be evicted by LRU during the 200MB load.
-NR_LOADED=$((NR_FILE_LOADED - NR_FILE_BEFORE))
-NR_FREED=$((NR_FILE_LOADED - NR_FILE_AFTER))
+# Theoretically, if all 512MB dedups to 1 page, nr_file_pages should be NR_FILE_BEFORE + 1
+EXPECTED_AFTER=$((NR_FILE_BEFORE + 1))
+
+DIFF=$((NR_FILE_AFTER - EXPECTED_AFTER))
+if [ "$DIFF" -lt 0 ]; then
+  DIFF=$((-DIFF))
+fi
 
 echo ""
-echo "Dedup efficiency:"
-echo "  Pages loaded into cache:  $NR_LOADED"
-echo "  Pages freed by dedup:     $NR_FREED"
-
-# On loopback, only ~half the loaded pages are from the XFS layer
-# (the other half is the ext4 cache of the .img file, untouchable).
-# On native XFS, nearly all loaded pages should be freed.
-if [ "$NR_LOADED" -gt 0 ]; then
-  EFFICIENCY=$((NR_FREED * 100 / NR_LOADED))
-  echo "  Efficiency:               ${EFFICIENCY}%"
-  if [ "$EFFICIENCY" -ge 30 ]; then
-    echo "  [OK] Dedup freed a significant portion of cached pages."
-  else
-    echo "  [!] WARNING: Low dedup efficiency. Check if pages were evicted or not deduped."
-  fi
+echo "Consistency check:"
+echo "  Expected nr_file_pages after dedup: ~$EXPECTED_AFTER"
+echo "  Actual nr_file_pages after dedup:    $NR_FILE_AFTER"
+if [ "$DIFF" -gt 2000 ]; then
+  echo "  [!] WARNING: nr_file_pages is off by $DIFF pages! Possible double accounting / leak!"
+  echo "               A small deviation (few hundred) is normal due to system activity."
 else
-  echo "  [!] No pages loaded? Something is wrong."
+  echo "  [OK] nr_file_pages looks consistent (within expected bounds)."
 fi
 
 echo ""
