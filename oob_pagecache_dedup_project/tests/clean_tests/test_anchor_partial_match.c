@@ -92,6 +92,7 @@ static int read_file_into_cache(const char *path)
 int main(void)
 {
     int ret = 0;
+    int fd = -1;
 
     printf("TEST: Anchor-Based Partial Match Detection\n");
     printf("=========================================\n");
@@ -108,7 +109,7 @@ int main(void)
 
     /* Create as all 'P' first (but don't queue yet) */
     {
-        int fd = open(FILE_B, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        fd = open(FILE_B, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) { perror(FILE_B); return 1; }
 
         char *buf = malloc(CHUNK_SIZE);
