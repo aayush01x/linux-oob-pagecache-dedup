@@ -2444,10 +2444,10 @@ unsigned filemap_get_folios_contig(struct address_space *mapping,
 
 			if (folio_test_hugetlb(folio))
 				nr = 1;
-			*start = folio->index + nr;
+			*start = xas.xa_index + nr;
 			goto out;
 		}
-		xas_advance(&xas, folio_next_index(folio) - 1);
+		xas_advance(&xas, xas.xa_index + folio_nr_pages(folio) - 1);
 		continue;
 put_folio:
 		folio_put(folio);
@@ -2464,7 +2464,7 @@ update_start:
 		if (folio_test_hugetlb(folio))
 			*start = folio->index + 1;
 		else
-			*start = folio_next_index(folio);
+			*start = xas.xa_index + folio_nr_pages(folio);
 	}
 out:
 	rcu_read_unlock();
@@ -2583,7 +2583,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
 			break;
 		if (folio_test_readahead(folio))
 			break;
-		xas_advance(&xas, folio_next_index(folio) - 1);
+		xas_advance(&xas, xas.xa_index + folio_nr_pages(folio) - 1);
 		continue;
 put_folio:
 		folio_put(folio);
