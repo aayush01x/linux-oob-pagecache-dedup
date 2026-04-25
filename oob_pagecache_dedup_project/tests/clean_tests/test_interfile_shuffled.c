@@ -218,9 +218,6 @@ int main(void)
         close(fd);
     }
 
-    /* Restore readahead */
-    (void)system("cat /tmp/ra_backup > /sys/block/loop0/queue/read_ahead_kb 2>/dev/null");
-    (void)system("cat /tmp/ra_backup > /sys/block/sda/queue/read_ahead_kb 2>/dev/null");
     printf("    Pages loaded as order-0 (no large folios)\n");
 
     /* --- Step 4: Queue for dedup --- */
@@ -245,6 +242,10 @@ int main(void)
     /* --- Step 6: Verify data integrity --- */
     printf("[5] Verifying all files (reading through deduped page cache)...\n");
     for (int f = 0; f < NUM_FILES; f++) {
+        /* Suppress readahead during verify to avoid large folio conflicts */
+        int vfd = open(filenames[f], O_RDONLY);
+        if (vfd >= 0) { posix_fadvise(vfd, 0, 0, POSIX_FADV_RANDOM); close(vfd); }
+
         if (verify_file(filenames[f], orders[f], NUM_PAGES, pgsz) < 0) {
             fprintf(stderr, "  [FAIL] %s verification failed!\n", filenames[f]);
             ret = 1;
@@ -265,6 +266,10 @@ int main(void)
         }
     }
     printf("  [+] All files deleted successfully.\n");
+
+    /* Restore readahead now that all deduped folios are gone */
+    (void)system("cat /tmp/ra_backup > /sys/block/loop0/queue/read_ahead_kb 2>/dev/null");
+    (void)system("cat /tmp/ra_backup > /sys/block/sda/queue/read_ahead_kb 2>/dev/null");
 
     printf("\n=== %s ===\n", ret == 0 ? "PASS" : "FAIL");
 
