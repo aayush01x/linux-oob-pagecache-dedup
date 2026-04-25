@@ -183,15 +183,33 @@ int main(void)
         fprintf(stderr, "  Warning: could not drop caches\n");
     sleep(1);
 
-    /* --- Step 3: Read into page cache --- */
-    printf("\n[2] Reading all files into page cache...\n");
+    /*
+     * Disable readahead to force order-0 folios (one page each).
+     * XFS readahead creates large folios (order-4 = 16 pages).
+     * The scanner hashes the ENTIRE folio, so shuffled large folios
+     * produce different hashes and never match.  With order-0 folios,
+     * each page gets its own hash → cross-file matches work.
+     */
+    printf("\n[2] Disabling readahead + reading files into page cache...\n");
+    if (system("cat /sys/block/loop0/queue/read_ahead_kb > /tmp/ra_backup 2>/dev/null") != 0)
+        (void)system("cat /sys/block/sda/queue/read_ahead_kb > /tmp/ra_backup 2>/dev/null");
+    (void)system("echo 0 > /sys/block/loop0/queue/read_ahead_kb 2>/dev/null");
+    (void)system("echo 0 > /sys/block/sda/queue/read_ahead_kb 2>/dev/null");
+
     for (int f = 0; f < NUM_FILES; f++) {
         int fd = open(filenames[f], O_RDONLY);
         if (fd < 0) { perror("open"); ret = 1; goto cleanup; }
+        /* POSIX_FADV_RANDOM also suppresses readahead */
+        posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
         char buf[4096];
         while (read(fd, buf, sizeof(buf)) > 0) {}
         close(fd);
     }
+
+    /* Restore readahead */
+    (void)system("cat /tmp/ra_backup > /sys/block/loop0/queue/read_ahead_kb 2>/dev/null");
+    (void)system("cat /tmp/ra_backup > /sys/block/sda/queue/read_ahead_kb 2>/dev/null");
+    printf("    Pages loaded as order-0 (no large folios)\n");
 
     /* --- Step 4: Queue for dedup --- */
     printf("[3] Queueing files for dedup...\n");
