@@ -37,7 +37,7 @@ cleanup_all() {
           intra_dedup_stress.dat cascade_*.dat \
           conc_tc_*.dat rededup_*.dat torture_*.dat \
           parttrunc_*.dat nfp_*.dat rapid_*.dat cowtrunc_*.dat \
-          anchor_partial_*.dat
+          anchor_partial_*.dat stress_*.dat
     cd "$SCRIPT_DIR"
 }
 
@@ -91,7 +91,8 @@ for src in test_cow_isolation_auto.c \
            test_nr_file_pages_leak.c \
            test_rapid_dedup_delete.c \
            test_cow_during_truncate.c \
-           test_anchor_partial_match.c; do
+           test_anchor_partial_match.c \
+           test_anchor_stress.c; do
     compile "$src" "common.c"
 done
 
@@ -124,6 +125,7 @@ run_one "NR_FILE_PAGES Leak"        test_nr_file_pages_leak
 run_one "Rapid Dedup-Delete"        test_rapid_dedup_delete
 run_one "COW During Truncate"       test_cow_during_truncate
 run_one "Anchor Partial Match"      test_anchor_partial_match
+run_one "Anchor Stress Test"        test_anchor_stress
 
 # ---------- summary ----------
 cleanup_all
@@ -145,7 +147,7 @@ rm -f test_cow_isolation_auto test_truncate_deduped test_delete_then_read \
       test_rededup_after_cow test_mixed_ops_torture \
       test_partial_truncate_dedup \
       test_nr_file_pages_leak test_rapid_dedup_delete test_cow_during_truncate \
-      test_anchor_partial_match
+      test_anchor_partial_match test_anchor_stress
 cd "$SCRIPT_DIR"
 
 if [ "$FAIL" -gt 0 ]; then
