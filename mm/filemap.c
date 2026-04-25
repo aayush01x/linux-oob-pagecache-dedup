@@ -2934,7 +2934,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 			size_t fsize = folio_size(folio);
 			size_t offset = iocb->ki_pos & (fsize - 1);
 			size_t bytes = min_t(loff_t, end_offset - iocb->ki_pos,
-					     fsize - offset);
+						     fsize - offset);
 			size_t copied;
 
 			if (end_offset < folio_pos(folio))
@@ -2950,6 +2950,17 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 				flush_dcache_folio(folio);
 
 			copied = copy_folio_to_iter(folio, offset, bytes, iter);
+
+			if (copied == 0 && bytes == 0) {
+				pr_info_ratelimited("OOB_DEDUP: [READ_LOOP] zero copy at ki_pos=%lld "
+					"fsize=%zu offset=%zu end_off=%lld folio_idx=%lu "
+					"folio_order=%u dedup=%d inode=%lu iter_count=%zu\n",
+					iocb->ki_pos, fsize, offset, end_offset,
+					folio->index, folio_order(folio),
+					folio_test_dedup(folio),
+					mapping->host->i_ino,
+					iov_iter_count(iter));
+			}
 
 			already_read += copied;
 			iocb->ki_pos += copied;
