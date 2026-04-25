@@ -613,7 +613,7 @@ static void oob_dedup_do_scan(void)
                 long nr = folio_nr_pages(folio);
                 pgoff_t folio_start = folio_index(folio);
 
-                pr_info("OOB_DEDUP: [SCAN] found folio at pgoff %lu, order=%u nr=%lu inode=%lu\n",
+                pr_debug("OOB_DEDUP: [SCAN] found folio at pgoff %lu, order=%u nr=%lu inode=%lu\n",
                         folio_start, folio_order(folio), nr,
                         slot_mapping->host->i_ino);
 
