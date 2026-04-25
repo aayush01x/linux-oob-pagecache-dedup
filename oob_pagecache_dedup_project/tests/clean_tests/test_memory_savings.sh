@@ -24,7 +24,7 @@ sleep 2
 echo ""
 echo "--- BASELINE (no test files) ---"
 grep -E "MemFree|MemAvailable|Cached" /proc/meminfo
-FREE_BEFORE=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+CACHED_BEFORE=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
 echo ""
 
 # Step 1: Create N identical large files
@@ -47,7 +47,17 @@ for i in $(seq 1 $NUM_FILES); do
     cat "dedup_test_$i.dat" > /dev/null
 done
 
-# Queue for dedup AFTER clean read
+# Measure BEFORE queuing for dedup — the scanner starts immediately
+# on fadvise, so we must capture the full cache footprint first.
+echo ""
+echo "--- AFTER LOADING (before dedup) ---"
+grep -E "MemFree|MemAvailable|Cached" /proc/meminfo
+CACHED_AFTER_LOAD=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
+CONSUMED=$(( (CACHED_AFTER_LOAD - CACHED_BEFORE) / 1024 ))
+echo "  -> ~${CONSUMED} MB consumed by page cache"
+echo ""
+
+# Queue for dedup AFTER measuring the pre-dedup baseline
 echo "[*] Queueing files for dedup..."
 for i in $(seq 1 $NUM_FILES); do
     python3 -c "
@@ -61,15 +71,6 @@ os.close(fd)
     echo "  [+] Queued dedup_test_$i.dat"
 done
 
-sleep 2
-echo ""
-echo "--- AFTER LOADING (before dedup) ---"
-grep -E "MemFree|MemAvailable|Cached" /proc/meminfo
-FREE_AFTER_LOAD=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-CONSUMED=$(( (FREE_BEFORE - FREE_AFTER_LOAD) / 1024 ))
-echo "  -> ~${CONSUMED} MB consumed by page cache"
-echo ""
-
 # Step 3: Wait for scanner
 WAIT=30
 echo "[3] Waiting ${WAIT}s for dedup scanner..."
@@ -82,8 +83,8 @@ echo ""
 echo ""
 echo "--- AFTER DEDUP ---"
 grep -E "MemFree|MemAvailable|Cached" /proc/meminfo
-FREE_AFTER_DEDUP=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
-SAVED=$(( (FREE_AFTER_DEDUP - FREE_AFTER_LOAD) / 1024 ))
+CACHED_AFTER_DEDUP=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
+SAVED=$(( (CACHED_AFTER_LOAD - CACHED_AFTER_DEDUP) / 1024 ))
 echo "  -> ~${SAVED} MB freed by dedup"
 echo ""
 

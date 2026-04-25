@@ -652,8 +652,14 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
              * here (inside xa_lock_irq), so use folio_put_refs.
              */
             folio_put_refs(folio, folio_nr_pages(folio));
+            /* Folio is leaving the page cache entirely —
+             * both XArray entries are cleared. */
+            folio->mapping = NULL;
+        } else {
+            /* Cross-file dissolution: folio survives in the
+             * other file's XArray. */
+            folio->mapping = last->mapping;
         }
-        folio->mapping = last->mapping;
         folio->index = last->index;
         list_del(&last->list);
         kmem_cache_free(rmap_entry_cache, last);
