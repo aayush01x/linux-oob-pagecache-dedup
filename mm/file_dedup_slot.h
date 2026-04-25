@@ -16,6 +16,7 @@ struct file_dedup_slot {
 	struct hlist_node hash;
 	struct list_head list;
 	struct address_space *mapping;
+	unsigned long pgoff;  /* per-slot scan cursor */
 };
 
 #define file_dedup_slot_entry(ptr, type, member) \

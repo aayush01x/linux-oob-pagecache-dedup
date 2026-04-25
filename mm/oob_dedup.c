@@ -32,7 +32,7 @@ static struct kmem_cache *rmap_entry_cache;
 static struct kmem_cache *dedup_info_cache;
 
 static unsigned int sleep_millisecs = 20;
-static unsigned int pages_to_scan = 100;
+static unsigned int pages_to_scan = 4096;
 #define MAX_PAGES_PER_FILE 1048576
 
 /* sysfs kobject and counters for the sysfs layer */
@@ -215,13 +215,18 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     spin_unlock(&info->lock);
 
     // setup the xarray of the dup_folio(its inode)
-    folio_get(orig_folio);
+    /* Take folio_nr_pages refs — matching what __filemap_add_folio
+     * does for normal page-cache entries.  This ensures
+     * filemap_free_folio() can drop the correct number of refs
+     * during truncation without special-casing dedup entries.
+     */
+    folio_ref_add(orig_folio, folio_nr_pages(orig_folio));
     xas_lock_irq(&xas);
     xas_store(&xas, orig_folio);
     if (xas_error(&xas)) {
         // xas_store failed
         xas_unlock_irq(&xas);
-        folio_put(orig_folio);
+        folio_put_refs(orig_folio, folio_nr_pages(orig_folio));
         
         spin_lock(&info->lock);
         list_del(&dup_entry->list);
@@ -251,13 +256,15 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     xas_unlock_irq(&xas);
     folio_put_refs(dup_folio, folio_nr_pages(dup_folio));
 
+    /*
+     * Subtract NR_FILE_PAGES for the dup_folio we just orphaned.
+     * Do NOT add NR_FILE_PAGES for orig_folio — it was already counted
+     * when it was first inserted into its own page cache.  Adding it
+     * again would inflate the stat and mask all memory savings.
+     */
     lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
     if (folio_test_pmd_mappable(dup_folio))
         lruvec_stat_mod_folio(dup_folio, NR_FILE_THPS, -folio_nr_pages(dup_folio));
-
-    lruvec_stat_mod_folio(orig_folio, NR_FILE_PAGES, folio_nr_pages(orig_folio));
-    if (folio_test_pmd_mappable(orig_folio))
-        lruvec_stat_mod_folio(orig_folio, NR_FILE_THPS, folio_nr_pages(orig_folio));
 
 
 #ifdef CONFIG_MEMCG
@@ -360,11 +367,10 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                             pr_info("Successfully split large folio at pgoff %lu. Scanner will re-visit.\n",
                                     index);
                             /*
-                             * Rewind the scanner cursor back to this folio's
-                             * base index so the split (now order-0) pages are
-                             * re-encountered on the very next pass
+                             * Note: per-slot pgoff tracking means this
+                             * rewind is handled by the scanner not advancing
+                             * past the folio when split is detected.
                              */
-                            oob_scan.pgoff = index;
                         } else {
                             pr_debug("Failed to split large folio.\n");
                         }
@@ -432,7 +438,6 @@ static void oob_dedup_do_scan(void)
 
         if (!oob_scan.slot || list_is_head(&oob_scan.slot->list, &file_dedup_list)) {
             oob_scan.slot = list_first_entry(&file_dedup_list, struct file_dedup_slot, list);
-            oob_scan.pgoff = 0;
             oob_scan.seqnr++;
         }
 
@@ -463,7 +468,6 @@ static void oob_dedup_do_scan(void)
                 oob_scan.slot = NULL;
             else
                 oob_scan.slot = next;
-            oob_scan.pgoff = 0;
 
             list_del(&slot->list);
             hash_del(&slot->hash);
@@ -474,9 +478,11 @@ static void oob_dedup_do_scan(void)
         }
         spin_unlock(&file_dedup_lock);
 
-        /* Scan pages from the current slot up to slot_budget pages. */
+        /* Scan pages from the current slot up to slot_budget pages.
+         * Use slot->pgoff for per-file progress tracking.
+         */
         while (slot_pages_done < slot_budget) {
-            folio = filemap_get_folio(slot_mapping, oob_scan.pgoff);
+            folio = filemap_get_folio(slot_mapping, slot->pgoff);
             if (!IS_ERR(folio)) {
                 long nr = folio_nr_pages(folio);
                 pgoff_t folio_start = folio_index(folio);
@@ -488,7 +494,7 @@ static void oob_dedup_do_scan(void)
                  */
                 if (folio_test_dedup(folio)) {
                     folio_put(folio);
-                    oob_scan.pgoff = folio_start + nr;
+                    slot->pgoff = folio_start + nr;
                     slot_pages_done += nr;
                     pages_done += nr;
                     atomic_add(nr, &stat_pages_scanned);
@@ -498,15 +504,15 @@ static void oob_dedup_do_scan(void)
                 /*
                  * Snapshot the cursor before the call so we can detect
                  * whether the split path inside check_and_store_folio
-                 * rewound oob_scan.pgoff.
+                 * rewound slot->pgoff.
                  */
-                pgoff_t pgoff_before = oob_scan.pgoff;
+                pgoff_t pgoff_before = slot->pgoff;
 
-                /* BUG-27 fix: pass folio base index, not oob_scan.pgoff */
+                /* BUG-27 fix: pass folio base index, not slot->pgoff */
                 check_and_store_folio(folio, slot_mapping, folio_start);
                 folio_put(folio);
 
-                if (oob_scan.pgoff != pgoff_before) {
+                if (slot->pgoff != pgoff_before) {
                     /*
                      * Split path rewound the cursor to folio_start.
                      * Don't advance further; the scanner will revisit the
@@ -514,13 +520,13 @@ static void oob_dedup_do_scan(void)
                      */
                 } else {
                     /* Normal case: advance past this folio. */
-                    oob_scan.pgoff = folio_start + nr;
+                    slot->pgoff = folio_start + nr;
                 }
                 slot_pages_done += nr;
                 pages_done += nr;
                 atomic_add(nr, &stat_pages_scanned);
             } else {
-                oob_scan.pgoff++;
+                slot->pgoff++;
                 slot_pages_done++;
                 pages_done++;
                 atomic_inc(&stat_pages_scanned);
@@ -528,8 +534,8 @@ static void oob_dedup_do_scan(void)
 
             unsigned long max_pages =
                     (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
-            if (oob_scan.pgoff >= max_pages ||
-                oob_scan.pgoff >= MAX_PAGES_PER_FILE) {
+            if (slot->pgoff >= max_pages ||
+                slot->pgoff >= MAX_PAGES_PER_FILE) {
                 /* Finished this file — remove and advance to next slot. */
                 spin_lock(&file_dedup_lock);
                 struct file_dedup_slot *next = list_next_entry(slot, list);
@@ -542,7 +548,6 @@ static void oob_dedup_do_scan(void)
                 hash_del(&slot->hash);
                 atomic_dec(&stat_files_queued);
                 file_dedup_slot_free(file_dedup_cache, slot);
-                oob_scan.pgoff = 0;
                 spin_unlock(&file_dedup_lock);
                 /* slot is gone; break inner loop, outer loop will pick next */
                 break;
@@ -557,7 +562,7 @@ static void oob_dedup_do_scan(void)
         /*
          * Per-slot budget exhausted but file not yet finished: advance the
          * cursor to the next slot so the next wakeup starts there (round-robin).
-         * The current slot stays in the queue at its updated pgoff.
+         * The current slot's pgoff is preserved in slot->pgoff.
          */
         if (oob_scan.slot == slot) {
             spin_lock(&file_dedup_lock);
@@ -567,9 +572,7 @@ static void oob_dedup_do_scan(void)
                                 ? list_first_entry(&file_dedup_list,
                                                    struct file_dedup_slot, list)
                                 : next;
-                /* pgoff for the *new* slot starts at 0 */
-                if (oob_scan.slot != slot)
-                    oob_scan.pgoff = 0;
+                /* pgoff is per-slot now — no reset needed */
             }
             spin_unlock(&file_dedup_lock);
         }
@@ -641,6 +644,14 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
             xas_set_order(&xas_other, last->index, folio_order(folio));
             xas_store(&xas_other, NULL);
             mapping->nrpages -= folio_nr_pages(folio);
+            /*
+             * Drop the refs held by the sibling XArray entry.
+             * Both home entries (__filemap_add_folio) and dedup
+             * entries (folio_ref_add in deduplicate_folio) hold
+             * folio_nr_pages refs.  We can't call filemap_free_folio
+             * here (inside xa_lock_irq), so use folio_put_refs.
+             */
+            folio_put_refs(folio, folio_nr_pages(folio));
         }
         folio->mapping = last->mapping;
         folio->index = last->index;
@@ -714,12 +725,28 @@ static ssize_t merge_threshold_pct_store(struct kobject *kobj, struct kobj_attri
     return count;
 }
 
+static ssize_t pages_to_scan_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%u\n", pages_to_scan);
+}
+
+static ssize_t pages_to_scan_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    unsigned int val;
+    if (kstrtouint(buf, 10, &val) == 0) {
+        if (val < 1) val = 1;
+        pages_to_scan = val;
+    }
+    return count;
+}
+
 static struct kobj_attribute files_queued_attr          = __ATTR_RO(files_queued);
 static struct kobj_attribute pages_deduped_attr         = __ATTR_RO(pages_deduped);
 static struct kobj_attribute pages_scanned_attr         = __ATTR_RO(pages_scanned);
 static struct kobj_attribute folios_split_attr          = __ATTR_RO(folios_split);
 static struct kobj_attribute sleep_millisecs_attr       = __ATTR_RW(sleep_millisecs);
 static struct kobj_attribute merge_threshold_pct_attr   = __ATTR_RW(merge_threshold_pct);
+static struct kobj_attribute pages_to_scan_attr         = __ATTR_RW(pages_to_scan);
 
 static struct attribute *oob_dedup_attrs[] = {
     &files_queued_attr.attr,
@@ -728,6 +755,7 @@ static struct attribute *oob_dedup_attrs[] = {
     &folios_split_attr.attr,
     &sleep_millisecs_attr.attr,
     &merge_threshold_pct_attr.attr,
+    &pages_to_scan_attr.attr,
     NULL,
 };
 ATTRIBUTE_GROUPS(oob_dedup); 
@@ -951,7 +979,6 @@ int oob_dedup_evict_inode(struct inode *inode)
                     oob_scan.slot = NULL;
                 else
                     oob_scan.slot = next;
-                oob_scan.pgoff = 0;
             }
 
             list_del(&slot->list);

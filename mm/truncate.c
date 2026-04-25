@@ -437,11 +437,17 @@ void truncate_inode_pages_range(struct address_space *mapping,
 		if (unlikely(has_dedup)) {
 			for (i = 0; i < folio_batch_count(&fbatch); i++) {
 				struct folio *f = fbatch.folios[i];
-				if (folio_test_dedup(f))
-					filemap_remove_folio_at(f, mapping,
-								indices[i]);
-				else
-					filemap_remove_folio(f);
+				/*
+				 * Always use index-aware removal when the batch
+				 * contains deduped folios. An earlier iteration
+				 * of this loop may dissolve a folio (rmap_count
+				 * drops to 1), restoring folio->index to the
+				 * last survivor's index — NOT the XArray index
+				 * we need to clear. filemap_remove_folio_at()
+				 * uses indices[i] which is always correct.
+				 */
+				filemap_remove_folio_at(f, mapping,
+							indices[i]);
 			}
 		} else {
 			delete_from_page_cache_batch(mapping, &fbatch);
@@ -521,6 +527,28 @@ void truncate_inode_pages_range(struct address_space *mapping,
 					truncate_cleanup_folio(folio);
 					filemap_remove_folio_at(folio, mapping,
 								indices[i]);
+				} else {
+					/*
+					 * The rmap entry for this index was
+					 * already removed by an earlier
+					 * disconnect (e.g. intra-file dissolve
+					 * cleared the sibling slot). The XArray
+					 * entry is stale — remove it directly
+					 * so nrpages reaches zero.
+					 */
+					spin_lock(&mapping->host->i_lock);
+					xa_lock_irq(&mapping->i_pages);
+					{
+						XA_STATE(xas, &mapping->i_pages, indices[i]);
+						xas_set_order(&xas, indices[i], folio_order(folio));
+						xas_store(&xas, NULL);
+					}
+					mapping->nrpages -= folio_nr_pages(folio);
+					xa_unlock_irq(&mapping->i_pages);
+					spin_unlock(&mapping->host->i_lock);
+					/* Drop the folio_nr_pages refs taken by
+					 * folio_ref_add() in deduplicate_folio(). */
+					filemap_free_folio(mapping, folio);
 				}
 			} else {
 				/*

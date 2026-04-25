@@ -161,6 +161,14 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 {
 	long nr;
 
+	/*
+	 * Deduped folios: NR_FILE_PAGES was already decremented when
+	 * deduplicate_folio() orphaned the duplicate.  Subtracting again
+	 * here would underflow the stat (the -3 MB artefact).
+	 */
+	if (folio_test_dedup(folio))
+		return;
+
 	VM_BUG_ON_FOLIO(folio_mapped(folio), folio);
 	if (!IS_ENABLED(CONFIG_DEBUG_VM) && unlikely(folio_mapped(folio))) {
 		pr_alert("BUG: Bad page cache in process %s  pfn:%05lx\n",
@@ -305,10 +313,27 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 	 */
 	was_dedup = folio_test_dedup(folio);
 
-	if (was_dedup)
+	if (was_dedup) {
 		oob_dedup_disconnect_folio(folio, mapping, index);
-	else
+		/*
+		 * filemap_unaccount_folio() returned early because the folio
+		 * was deduped.  If disconnect dissolved the dedup (rmap_count
+		 * dropped to 1 or 0), the canonical folio's NR_FILE_PAGES
+		 * was never decremented.  Fix it now for:
+		 *   - same-mapping dissolution (folio->mapping == mapping)
+		 *   - orphaned folio (folio->mapping == NULL)
+		 * For cross-file dissolution (folio->mapping == other_mapping),
+		 * the surviving mapping's truncation will handle NR_FILE_PAGES.
+		 */
+		if (!folio_test_dedup(folio) &&
+		    (folio->mapping == mapping || folio->mapping == NULL)) {
+			__lruvec_stat_mod_folio(folio, NR_FILE_PAGES, -nr);
+		}
+	} else if (folio->mapping == mapping) {
 		folio->mapping = NULL;
+	}
+	/* else: folio was dissolved and now belongs to another mapping —
+	 * do NOT null out folio->mapping. */
 
 	mapping->nrpages -= nr;
 
@@ -317,6 +342,12 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 		inode_add_lru(inode);
 	spin_unlock(&inode->i_lock);
 
+	/*
+	 * Every XArray entry holds folio_nr_pages refs:
+	 *   - Home entry: from __filemap_add_folio()
+	 *   - Dedup entries: from folio_ref_add() in deduplicate_folio()
+	 * filemap_free_folio() drops the correct number in all cases.
+	 */
 	filemap_free_folio(mapping, folio);
 }
 
