@@ -25,7 +25,8 @@
 
 #define NUM_FILES     10
 #define NUM_PAGES     32   /* unique pages per file (small: 32 × 4K = 128K each) */
-#define SCANNER_WAIT  15   /* seconds to wait for scanner */
+#define SCANNER_WAIT  45   /* seconds: need more time for split + re-scan */
+#define SYSFS_THRESHOLD "/sys/kernel/oob_dedup/merge_threshold_pct"
 
 /* Fisher-Yates shuffle */
 static void shuffle(int *arr, int n)
@@ -129,6 +130,18 @@ int main(void)
 
     srand(42);  /* deterministic for reproducibility */
 
+    /*
+     * Lower merge_threshold so that even a 1-page partial match in a
+     * large folio triggers a split.  After splitting, the scanner
+     * re-visits the now order-0 pages and deduplicates them individually.
+     */
+    int orig_threshold = 50;
+    FILE *sf = fopen(SYSFS_THRESHOLD, "r");
+    if (sf) { fscanf(sf, "%d", &orig_threshold); fclose(sf); }
+    sf = fopen(SYSFS_THRESHOLD, "w");
+    if (sf) { fprintf(sf, "1"); fclose(sf); printf("  Set merge_threshold_pct = 1%%\n"); }
+    else     { fprintf(stderr, "  Warning: cannot write %s\n", SYSFS_THRESHOLD); }
+
     /* --- Step 1: Generate file orders --- */
     for (int f = 0; f < NUM_FILES; f++) {
         snprintf(filenames[f], sizeof(filenames[f]),
@@ -224,6 +237,12 @@ int main(void)
     printf("  [+] All files deleted successfully.\n");
 
     printf("\n=== %s ===\n", ret == 0 ? "PASS" : "FAIL");
+
+    /* Restore original threshold */
+    sf = fopen(SYSFS_THRESHOLD, "w");
+    if (sf) { fprintf(sf, "%d", orig_threshold); fclose(sf); }
+    printf("  Restored merge_threshold_pct = %d%%\n", orig_threshold);
+
     return ret;
 
 cleanup:
