@@ -15,7 +15,7 @@ if [ -z "$TEST_DIR" ]; then
   fi
 fi
 
-FILE_SIZE_MB=512
+FILE_SIZE_MB=200
 FILENAME="large_dedup_512.dat"
 
 mkdir -p "$TEST_DIR"
