@@ -4,9 +4,35 @@ import subprocess
 import time
 import json
 import matplotlib.pyplot as plt
+import shutil
 
-TEST_DIR = "/tmp/dedup_profile_test"
-SIZES_MB = [32, 64, 128, 256, 512, 1024]
+# Auto-detect XFS mount, fall back to /tmp
+def detect_test_dir():
+    try:
+        out = subprocess.run(
+            ["findmnt", "-t", "xfs", "-n", "-o", "TARGET"],
+            capture_output=True, text=True
+        )
+        xfs = out.stdout.strip().split('\n')[0].strip()
+        if xfs and os.path.isdir(xfs) and os.access(xfs, os.W_OK):
+            return os.path.join(xfs, "dedup_profile_test")
+    except Exception:
+        pass
+    return "/tmp/dedup_profile_test"
+
+TEST_DIR = os.environ.get("TEST_DIR", detect_test_dir())
+
+# Filter sizes to fit available disk (need ~4× size for 4 test files)
+def get_sizes(base_sizes, test_dir):
+    os.makedirs(test_dir, exist_ok=True)
+    avail_mb = shutil.disk_usage(test_dir).free // (1024 * 1024)
+    return [s for s in base_sizes if s * 4 < avail_mb - 50]
+
+SIZES_MB = get_sizes([32, 64, 128, 256, 512, 1024], TEST_DIR)
+if not SIZES_MB:
+    SIZES_MB = [32]
+    print(f"WARNING: Very limited disk space, only testing 32MB")
+
 RESULTS = {}
 
 def run_cmd(cmd, shell=True):
@@ -41,9 +67,15 @@ def read_sysfs_int(path):
         return 0
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    profile_bin = os.path.join(TEST_DIR, "profile_io")
+
     # Compile the C program
-    run_cmd("gcc -o profile_io profile_io.c")
-    print("Compiled profile_io.c")
+    src = os.path.join(script_dir, "profile_io.c")
+    run_cmd(f"gcc -O2 -o {profile_bin} {src}")
+    print(f"Compiled profile_io.c")
+    print(f"Test directory: {TEST_DIR}")
+    print(f"Sizes to test: {SIZES_MB}")
 
     run_cmd(f"mkdir -p {TEST_DIR}")
     
@@ -73,11 +105,11 @@ def main():
         # We don't warm cache for write, we just write to it (page cache will be populated during write)
         
         # Profile Normal Read
-        out = run_cmd(f"./profile_io --read {f_nread}")
+        out = run_cmd(f"{profile_bin} --read {f_nread}")
         RESULTS[size]['norm_read_ns'] = parse_time_ns(out)
         
         # Profile Normal Write
-        out = run_cmd(f"./profile_io --write {f_nwrite}")
+        out = run_cmd(f"{profile_bin} --write {f_nwrite}")
         RESULTS[size]['norm_write_ns'] = parse_time_ns(out)
 
         print("  Phase 2: Deduplication")
@@ -89,7 +121,7 @@ def main():
         pages_deduped_before = read_sysfs_int("/sys/kernel/oob_dedup/pages_deduped")
 
         # Profile Dedup
-        out = run_cmd(f"./profile_io --dedup {f_dedup1} {f_dedup2}")
+        out = run_cmd(f"{profile_bin} --dedup {f_dedup1} {f_dedup2}")
         RESULTS[size]['dedup_ns'] = parse_time_ns(out)
 
         pages_deduped_after = read_sysfs_int("/sys/kernel/oob_dedup/pages_deduped")
@@ -98,11 +130,11 @@ def main():
         
         print("  Phase 3: Deduped Operations")
         # Profile Dedup Read
-        out = run_cmd(f"./profile_io --read {f_dedup1}")
+        out = run_cmd(f"{profile_bin} --read {f_dedup1}")
         RESULTS[size]['dedup_read_ns'] = parse_time_ns(out)
 
         # Profile Dedup Write (CoW)
-        out = run_cmd(f"./profile_io --write {f_dedup2}")
+        out = run_cmd(f"{profile_bin} --write {f_dedup2}")
         RESULTS[size]['dedup_write_ns'] = parse_time_ns(out)
 
         # Clean up files to save space
