@@ -121,6 +121,18 @@ int main(void)
     int ret = 0;
     long pgsz = sysconf(_SC_PAGESIZE);
 
+    /* Auto-detect XFS mount and cd there for large folio avoidance */
+    FILE *fp = popen("findmnt -t xfs -n -o TARGET 2>/dev/null | head -1", "r");
+    if (fp) {
+        char xfs_path[256] = {0};
+        if (fgets(xfs_path, sizeof(xfs_path), fp)) {
+            xfs_path[strcspn(xfs_path, "\n")] = '\0';
+            if (xfs_path[0] && chdir(xfs_path) == 0)
+                printf("  Working directory: %s (XFS)\n", xfs_path);
+        }
+        pclose(fp);
+    }
+
     printf("=== Inter-File Shuffled Dedup Test ===\n");
     printf("  Files: %d, Pages/file: %d, Page size: %ld\n",
            NUM_FILES, NUM_PAGES, pgsz);
