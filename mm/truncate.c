@@ -290,6 +290,34 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 		folio_invalidate(folio, offset, length);
 	if (!folio_test_large(folio))
 		return true;
+
+	/*
+	 * OOB dedup fix: deduped folios have folio->mapping set to a tagged
+	 * pointer (oob_dedup_info), not a real address_space.  split_folio()
+	 * dereferences mapping->i_mmap_rwsem which causes a GPF.
+	 * Dissolve dedup first to restore the real mapping pointer.
+	 */
+	if (unlikely(folio_test_dedup(folio))) {
+		pr_info("OOB_DEDUP: [TRUNC] dissolving dedup on large folio at pgoff %lu "
+			"(order=%u) before split\n",
+			folio_index(folio), folio_order(folio));
+		oob_dedup_disconnect_folio(folio, mapping, target_index);
+
+		/*
+		 * After disconnect, folio may or may not still be deduped
+		 * (depends on rmap_count).  If still deduped, we cannot
+		 * split — fall through to truncate_inode_folio which
+		 * handles tagged mappings safely via fake_mapping swap.
+		 */
+		if (folio_test_dedup(folio)) {
+			pr_info("OOB_DEDUP: [TRUNC] folio still shared after disconnect, "
+				"removing entirely\n");
+			truncate_inode_folio(mapping, folio);
+			return true;
+		}
+		/* mapping pointer is now a real address_space — safe to split */
+	}
+
 	if (try_folio_split_or_unmap(folio) == 0)
 		return true;
 	if (folio_test_dirty(folio))
