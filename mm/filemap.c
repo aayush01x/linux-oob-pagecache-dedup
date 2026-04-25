@@ -2796,6 +2796,10 @@ retry:
 	if (!folio_batch_count(fbatch)) {
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
 			return -EAGAIN;
+		pr_info_ratelimited("OOB_DEDUP: [READ_DEBUG] empty batch at index %lu, "
+			"creating folio (inode %lu)\n",
+			(unsigned long)(iocb->ki_pos >> PAGE_SHIFT),
+			mapping->host->i_ino);
 		err = filemap_create_folio(filp, mapping,
 				iocb->ki_pos >> PAGE_SHIFT, fbatch);
 		if (err == AOP_TRUNCATED_PAGE)
