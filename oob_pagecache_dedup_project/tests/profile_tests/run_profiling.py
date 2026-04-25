@@ -46,7 +46,9 @@ def run_cmd(cmd, shell=True):
     return res.stdout
 
 def drop_caches():
-    pass
+    run_cmd("sync")
+    run_cmd("echo 3 > /proc/sys/vm/drop_caches", shell=True)
+    time.sleep(1)
 
 def create_file(path, size_mb):
     # Use dd to create a file of exact size filled with 'X'
@@ -137,7 +139,8 @@ def main():
         out = run_cmd(f"{profile_bin} --write {f_dedup2}")
         RESULTS[size]['dedup_write_ns'] = parse_time_ns(out)
 
-        # Clean up files to save space
+        # Drop caches before rm to dissolve dedup and avoid O(n²) truncation
+        drop_caches()
         run_cmd(f"rm -f {f_nread} {f_nwrite} {f_dedup1} {f_dedup2}")
 
     sar_proc.terminate()
