@@ -31,7 +31,17 @@ echo ""
 echo "[1] Creating $NUM_FILES identical ${FILE_SIZE_MB}MB files..."
 for i in $(seq 1 $NUM_FILES); do
     dd if=/dev/zero bs=1M count=$FILE_SIZE_MB 2>/dev/null | tr '\0' "$FILL_CHAR" > "dedup_test_$i.dat"
-    # Queue for dedup
+    echo "  Created dedup_test_$i.dat"
+done
+
+# Flush all dirty pages to disk so folios are clean for dedup
+echo "[*] Syncing to flush dirty pages..."
+sync
+sleep 2
+
+# Now queue for dedup (after sync so pages are clean)
+echo "[*] Queueing files for dedup..."
+for i in $(seq 1 $NUM_FILES); do
     python3 -c "
 import os, ctypes
 POSIX_FADV_DEDUP = 8
@@ -40,7 +50,7 @@ libc = ctypes.CDLL('libc.so.6')
 libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DEDUP)
 os.close(fd)
 " 2>/dev/null || true
-    echo "  Created & queued dedup_test_$i.dat"
+    echo "  [+] Queued dedup_test_$i.dat"
 done
 
 # Force files into page cache by reading them
