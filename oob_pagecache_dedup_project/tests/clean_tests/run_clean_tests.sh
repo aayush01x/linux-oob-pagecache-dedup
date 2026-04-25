@@ -36,7 +36,8 @@ cleanup_all() {
           sysfs_stat_*.dat fanout_*.dat large_folio_*.dat \
           intra_dedup_stress.dat cascade_*.dat \
           conc_tc_*.dat rededup_*.dat torture_*.dat \
-          parttrunc_*.dat nfp_*.dat rapid_*.dat cowtrunc_*.dat
+          parttrunc_*.dat nfp_*.dat rapid_*.dat cowtrunc_*.dat \
+          interfile_shuf_*.dat
     cd "$SCRIPT_DIR"
 }
 
@@ -89,7 +90,8 @@ for src in test_cow_isolation_auto.c \
            test_partial_truncate_dedup.c \
            test_nr_file_pages_leak.c \
            test_rapid_dedup_delete.c \
-           test_cow_during_truncate.c; do
+           test_cow_during_truncate.c \
+           test_interfile_shuffled.c; do
     compile "$src" "common.c"
 done
 
@@ -121,6 +123,7 @@ run_one "Partial Truncate Dedup"    test_partial_truncate_dedup
 run_one "NR_FILE_PAGES Leak"        test_nr_file_pages_leak
 run_one "Rapid Dedup-Delete"        test_rapid_dedup_delete
 run_one "COW During Truncate"       test_cow_during_truncate
+run_one "Inter-File Shuffled"       test_interfile_shuffled
 
 # ---------- summary ----------
 cleanup_all
@@ -141,7 +144,8 @@ rm -f test_cow_isolation_auto test_truncate_deduped test_delete_then_read \
       test_intra_file_dedup test_cascade_unlink test_concurrent_trunc_cow \
       test_rededup_after_cow test_mixed_ops_torture \
       test_partial_truncate_dedup \
-      test_nr_file_pages_leak test_rapid_dedup_delete test_cow_during_truncate
+      test_nr_file_pages_leak test_rapid_dedup_delete test_cow_during_truncate \
+      test_interfile_shuffled
 cd "$SCRIPT_DIR"
 
 if [ "$FAIL" -gt 0 ]; then
