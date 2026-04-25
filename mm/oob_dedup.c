@@ -1131,9 +1131,14 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         if (folio_test_pmd_mappable(new_folio))
             __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
 
-        __lruvec_stat_mod_folio(old_folio, NR_FILE_PAGES, -folio_nr_pages(old_folio));
-        if (folio_test_pmd_mappable(old_folio))
-            __lruvec_stat_mod_folio(old_folio, NR_FILE_THPS, -folio_nr_pages(old_folio));
+        /*
+         * Do NOT decrement NR_FILE_PAGES for old_folio here.
+         * old_folio is still live in another file's (or this file's)
+         * XArray at its original index.  Its NR_FILE_PAGES +1 was
+         * counted once at initial load.  The shared B[0] entry never
+         * incremented NR (deduplicate_folio deliberately skips it),
+         * so un-sharing via COW must not decrement either.
+         */
 
         /* VERIFICATION BLOCK */
         struct folio *check_folio = xas_load(&xas); 

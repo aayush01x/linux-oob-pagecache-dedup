@@ -148,6 +148,20 @@ static void page_cache_delete(struct address_space *mapping,
 	was_dedup = folio_test_dedup(folio);
 	if (was_dedup) {
 		oob_dedup_disconnect_folio(folio, mapping, f_index);
+		/*
+		 * filemap_unaccount_folio() returned early because the folio
+		 * was deduped.  If disconnect dissolved the dedup (rmap_count
+		 * dropped to 1 or 0), the folio may be leaving the page cache.
+		 * Decrement NR_FILE_PAGES now for:
+		 *   - same-mapping dissolution (folio->mapping == mapping)
+		 *   - orphaned folio (folio->mapping == NULL)
+		 * For cross-file dissolution (folio->mapping == other_mapping),
+		 * the folio survives — no decrement needed.
+		 */
+		if (!folio_test_dedup(folio) &&
+		    (folio->mapping == mapping || folio->mapping == NULL)) {
+			__lruvec_stat_mod_folio(folio, NR_FILE_PAGES, -nr);
+		}
 	} else {
 		folio->mapping = NULL;
 	}
@@ -447,10 +461,21 @@ static void page_cache_delete_batch(struct address_space *mapping,
 		WARN_ON_ONCE(!folio_test_locked(folio));
 
 		if (folio_test_dedup(folio)) {
-        oob_dedup_disconnect_folio(folio, mapping, xas.xa_index);
-    } else {
-        folio->mapping = NULL;
-    }
+			oob_dedup_disconnect_folio(folio, mapping, xas.xa_index);
+			/*
+			 * Same dissolution stat fix as page_cache_delete:
+			 * if the folio is leaving the cache entirely,
+			 * decrement NR_FILE_PAGES (skipped by
+			 * filemap_unaccount_folio's early return).
+			 */
+			if (!folio_test_dedup(folio) &&
+			    (folio->mapping == mapping || folio->mapping == NULL)) {
+				__lruvec_stat_mod_folio(folio, NR_FILE_PAGES,
+							-folio_nr_pages(folio));
+			}
+		} else {
+			folio->mapping = NULL;
+		}
 		/* Leave folio->index set: truncation lookup relies on it */
 
 		i++;
