@@ -19,13 +19,13 @@
 #include <errno.h>
 #include <sys/stat.h>
 
-#include "common.h"
+#ifndef POSIX_FADV_DEDUP
+#define POSIX_FADV_DEDUP 8
+#endif
 
 #define NUM_FILES     10
 #define NUM_PAGES     32   /* unique pages per file (small: 32 × 4K = 128K each) */
 #define SCANNER_WAIT  15   /* seconds to wait for scanner */
-
-static char page_buf[PAGE_SIZE];
 
 /* Fisher-Yates shuffle */
 static void shuffle(int *arr, int n)
@@ -39,73 +39,77 @@ static void shuffle(int *arr, int n)
 }
 
 /*
- * Fill page_buf with a deterministic, unique pattern for page 'page_id'.
- * Each page is filled with: 4-byte page_id repeated, then XOR'd with offset
- * to make every byte position unique.
+ * Fill buf (of size pgsz) with a deterministic, unique pattern for page_id.
  */
-static void fill_page(int page_id)
+static void fill_page(char *buf, long pgsz, int page_id)
 {
-    for (int i = 0; i < PAGE_SIZE; i++) {
-        /* Unique per page_id, varies across the page */
-        page_buf[i] = (char)((page_id * 37 + i * 7) & 0xFF);
-    }
+    for (long i = 0; i < pgsz; i++)
+        buf[i] = (char)((page_id * 37 + i * 7) & 0xFF);
     /* Stamp the page_id at the start for easy verification */
-    memcpy(page_buf, &page_id, sizeof(page_id));
+    memcpy(buf, &page_id, sizeof(page_id));
 }
 
-static int create_shuffled_file(const char *path, int *order, int npages)
+static int create_shuffled_file(const char *path, int *order, int npages, long pgsz)
 {
+    char *buf = malloc(pgsz);
+    if (!buf) return -1;
+
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         perror("open");
+        free(buf);
         return -1;
     }
 
     for (int i = 0; i < npages; i++) {
-        fill_page(order[i]);
-        if (write(fd, page_buf, PAGE_SIZE) != PAGE_SIZE) {
+        fill_page(buf, pgsz, order[i]);
+        if (write(fd, buf, pgsz) != pgsz) {
             perror("write");
             close(fd);
+            free(buf);
             return -1;
         }
     }
 
     close(fd);
+    free(buf);
     return 0;
 }
 
-static int verify_file(const char *path, int *order, int npages)
+static int verify_file(const char *path, int *order, int npages, long pgsz)
 {
+    char *expected = malloc(pgsz);
+    char *actual = malloc(pgsz);
+    if (!expected || !actual) { free(expected); free(actual); return -1; }
+
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         perror("open");
+        free(expected); free(actual);
         return -1;
     }
 
     for (int i = 0; i < npages; i++) {
-        char expected[PAGE_SIZE];
-        char actual[PAGE_SIZE];
+        fill_page(expected, pgsz, order[i]);
 
-        /* Generate expected content for this page */
-        for (int j = 0; j < PAGE_SIZE; j++)
-            expected[j] = (char)((order[i] * 37 + j * 7) & 0xFF);
-        memcpy(expected, &order[i], sizeof(order[i]));
-
-        if (read(fd, actual, PAGE_SIZE) != PAGE_SIZE) {
+        if (read(fd, actual, pgsz) != pgsz) {
             perror("read");
             close(fd);
+            free(expected); free(actual);
             return -1;
         }
 
-        if (memcmp(expected, actual, PAGE_SIZE) != 0) {
+        if (memcmp(expected, actual, pgsz) != 0) {
             fprintf(stderr, "  [FAIL] %s page %d (page_id=%d) content mismatch!\n",
                     path, i, order[i]);
             close(fd);
+            free(expected); free(actual);
             return -1;
         }
     }
 
     close(fd);
+    free(expected); free(actual);
     return 0;
 }
 
@@ -114,10 +118,11 @@ int main(void)
     char filenames[NUM_FILES][64];
     int orders[NUM_FILES][NUM_PAGES];
     int ret = 0;
+    long pgsz = sysconf(_SC_PAGESIZE);
 
     printf("=== Inter-File Shuffled Dedup Test ===\n");
-    printf("  Files: %d, Pages/file: %d, Page size: %d\n",
-           NUM_FILES, NUM_PAGES, PAGE_SIZE);
+    printf("  Files: %d, Pages/file: %d, Page size: %ld\n",
+           NUM_FILES, NUM_PAGES, pgsz);
     printf("  Each file has %d UNIQUE pages (no intra-file dedup possible)\n",
            NUM_PAGES);
     printf("  All files share the same page set in DIFFERENT order\n\n");
@@ -151,7 +156,7 @@ int main(void)
     /* --- Step 2: Create files --- */
     printf("[1] Creating %d shuffled files...\n", NUM_FILES);
     for (int f = 0; f < NUM_FILES; f++) {
-        if (create_shuffled_file(filenames[f], orders[f], NUM_PAGES) < 0) {
+        if (create_shuffled_file(filenames[f], orders[f], NUM_PAGES, pgsz) < 0) {
             fprintf(stderr, "  Failed to create %s\n", filenames[f]);
             ret = 1;
             goto cleanup;
@@ -161,7 +166,8 @@ int main(void)
 
     /* Flush + drop caches to clear fs private data */
     sync();
-    system("echo 3 > /proc/sys/vm/drop_caches");
+    if (system("echo 3 > /proc/sys/vm/drop_caches") != 0)
+        fprintf(stderr, "  Warning: could not drop caches\n");
     sleep(1);
 
     /* --- Step 3: Read into page cache --- */
@@ -169,8 +175,8 @@ int main(void)
     for (int f = 0; f < NUM_FILES; f++) {
         int fd = open(filenames[f], O_RDONLY);
         if (fd < 0) { perror("open"); ret = 1; goto cleanup; }
-        char buf[PAGE_SIZE];
-        while (read(fd, buf, PAGE_SIZE) > 0) {}
+        char buf[4096];
+        while (read(fd, buf, sizeof(buf)) > 0) {}
         close(fd);
     }
 
@@ -196,7 +202,7 @@ int main(void)
     /* --- Step 6: Verify data integrity --- */
     printf("[5] Verifying all files (reading through deduped page cache)...\n");
     for (int f = 0; f < NUM_FILES; f++) {
-        if (verify_file(filenames[f], orders[f], NUM_PAGES) < 0) {
+        if (verify_file(filenames[f], orders[f], NUM_PAGES, pgsz) < 0) {
             fprintf(stderr, "  [FAIL] %s verification failed!\n", filenames[f]);
             ret = 1;
         } else {

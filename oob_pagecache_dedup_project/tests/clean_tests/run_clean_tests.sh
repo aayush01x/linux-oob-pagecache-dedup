@@ -90,13 +90,13 @@ for src in test_cow_isolation_auto.c \
            test_partial_truncate_dedup.c \
            test_nr_file_pages_leak.c \
            test_rapid_dedup_delete.c \
-           test_cow_during_truncate.c \
-           test_interfile_shuffled.c; do
+           test_cow_during_truncate.c; do
     compile "$src" "common.c"
 done
 
-# Standalone test (no common.c)
+# Standalone tests (no common.c)
 compile test_large_folio.c ""
+compile test_interfile_shuffled.c ""
 
 echo "[*] Compilation done."
 echo ""
