@@ -1042,6 +1042,9 @@ bool oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping,
         list_del(&last->list);
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
+    } else if (info->rmap_count == 0) {
+        folio->mapping = NULL;
+        dissolve = true;
     }
 	return dissolve;
 }

@@ -2607,11 +2607,13 @@ static bool filemap_range_uptodate(struct address_space *mapping,
 	if (mapping->host->i_blkbits >= folio_shift(folio))
 		return false;
 
-	if (folio_pos(folio) > pos) {
-		count -= folio_pos(folio) - pos;
+	loff_t fpos = (loff_t)folio_index_in(folio, mapping) << PAGE_SHIFT;
+
+	if (fpos > pos) {
+		count -= fpos - pos;
 		pos = 0;
 	} else {
-		pos -= folio_pos(folio);
+		pos -= fpos;
 	}
 
 	return mapping->a_ops->is_partially_uptodate(folio, pos, count);
@@ -2900,7 +2902,9 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 						     fsize - offset);
 			size_t copied;
 
-			if (end_offset < folio_pos(folio))
+			loff_t fpos = (loff_t)folio_index_in(folio, mapping) << PAGE_SHIFT;
+
+			if (end_offset < fpos)
 				break;
 			if (i > 0)
 				folio_mark_accessed(folio);
@@ -3154,7 +3158,9 @@ ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
 			struct folio *folio = fbatch.folios[i];
 			size_t n;
 
-			if (folio_pos(folio) >= end_offset)
+			loff_t fpos = (loff_t)folio_index_in(folio, in->f_mapping) << PAGE_SHIFT;
+
+			if (fpos >= end_offset)
 				goto out;
 			folio_mark_accessed(folio);
 
