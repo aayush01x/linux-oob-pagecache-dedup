@@ -117,42 +117,6 @@ run_exp2_scan_throughput() {
     log "  -> $OUT"
 }
 
-# ─── Experiment 3: Read Latency (Normal vs Deduped) ──────
-run_exp3_read_latency() {
-    log "=== EXP 3: Read Latency — Normal vs Deduped ==="
-    local OUT="$RESULTS_DIR/exp3_read_latency.csv"
-    echo "size_mb,normal_read_ns,normal_read_mbps,dedup_read_ns,dedup_read_mbps" > "$OUT"
-
-    for SZ in 4 8 16 32 64; do
-        log "  size=${SZ}MB..."
-        create_file "$WORK_DIR/rl_a.dat" "$SZ" "R"
-        cp "$WORK_DIR/rl_a.dat" "$WORK_DIR/rl_b.dat"
-
-        # Normal read (warm cache)
-        drop_caches
-        cat "$WORK_DIR/rl_a.dat" > /dev/null
-        local NR=$("$BENCH" --read "$WORK_DIR/rl_a.dat")
-        local NR_NS=$(echo "$NR" | awk -F': ' '/read_time_ns/{print $2}')
-        local NR_MBPS=$(echo "$NR" | awk -F': ' '/read_throughput_mbps/{print $2}')
-
-        # Dedup then read
-        drop_caches
-        cat "$WORK_DIR/rl_a.dat" > /dev/null
-        cat "$WORK_DIR/rl_b.dat" > /dev/null
-        "$BENCH" --dedup "$WORK_DIR/rl_a.dat" "$WORK_DIR/rl_b.dat" > /dev/null 2>&1
-
-        local DR=$("$BENCH" --read "$WORK_DIR/rl_a.dat")
-        local DR_NS=$(echo "$DR" | awk -F': ' '/read_time_ns/{print $2}')
-        local DR_MBPS=$(echo "$DR" | awk -F': ' '/read_throughput_mbps/{print $2}')
-
-        echo "$SZ,$NR_NS,$NR_MBPS,$DR_NS,$DR_MBPS" >> "$OUT"
-
-        drop_caches
-        rm -f "$WORK_DIR"/rl_*.dat
-    done
-    log "  -> $OUT"
-}
-
 # ─── Experiment 4: Write/COW Latency ─────────────────────
 run_exp4_write_latency() {
     log "=== EXP 4: Write Latency — Normal vs COW ==="
@@ -283,42 +247,6 @@ os.close(fd)
     log "  -> $OUT"
 }
 
-# ─── Experiment 7: NR_FILE_PAGES Stability ───────────────
-run_exp7_accounting_stability() {
-    log "=== EXP 7: NR_FILE_PAGES Accounting Stability ==="
-    local OUT="$RESULTS_DIR/exp7_accounting.csv"
-    echo "cycle,cached_before_kb,cached_after_dedup_kb,cached_after_cow_kb,cached_after_delete_kb,drift_kb" > "$OUT"
-
-    for C in $(seq 1 5); do
-        log "  cycle $C/5..."
-        drop_caches; sleep 1
-        local C0=$(cached_kb)
-
-        create_file "$WORK_DIR/ac_a.dat" 8 "A"
-        cp "$WORK_DIR/ac_a.dat" "$WORK_DIR/ac_b.dat"
-        drop_caches
-        cat "$WORK_DIR/ac_a.dat" > /dev/null
-        cat "$WORK_DIR/ac_b.dat" > /dev/null
-
-        "$BENCH" --dedup "$WORK_DIR/ac_a.dat" "$WORK_DIR/ac_b.dat" > /dev/null 2>&1
-        local C1=$(cached_kb)
-
-        # COW: overwrite file B
-        "$BENCH" --write "$WORK_DIR/ac_b.dat" > /dev/null 2>&1
-        local C2=$(cached_kb)
-
-        # Delete both
-        drop_caches
-        rm -f "$WORK_DIR"/ac_*.dat
-        drop_caches; sleep 1
-        local C3=$(cached_kb)
-        local DRIFT=$(( C3 - C0 ))
-
-        echo "$C,$C0,$C1,$C2,$C3,$DRIFT" >> "$OUT"
-    done
-    log "  -> $OUT"
-}
-
 # ─── Run All Experiments ──────────────────────────────────
 log "╔══════════════════════════════════════════════════╗"
 log "║   OOB Page Cache Dedup — Comprehensive Profiling ║"
@@ -330,11 +258,9 @@ echo ""
 
 run_exp1_memory_savings
 run_exp2_scan_throughput
-run_exp3_read_latency
 run_exp4_write_latency
 run_exp5_fanout_scalability
 run_exp6_live_trace
-run_exp7_accounting_stability
 
 log ""
 log "All experiments complete. Generating graphs..."

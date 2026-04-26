@@ -156,7 +156,7 @@ static void page_cache_delete(struct address_space *mapping,
 		 *   - same-mapping dissolution (folio->mapping == mapping)
 		 *   - orphaned folio (folio->mapping == NULL)
 		 * For cross-file dissolution (folio->mapping == other_mapping),
-		 * the folio survives — no decrement needed.
+		 * the folio survives,  no decrement needed.
 		 */
 		if (!folio_test_dedup(folio) &&
 		    (folio->mapping == mapping || folio->mapping == NULL)) {
@@ -175,11 +175,6 @@ static void filemap_unaccount_folio(struct address_space *mapping,
 {
 	long nr;
 
-	/*
-	 * Deduped folios: NR_FILE_PAGES was already decremented when
-	 * deduplicate_folio() orphaned the duplicate.  Subtracting again
-	 * here would underflow the stat (the -3 MB artefact).
-	 */
 	if (folio_test_dedup(folio))
 		return;
 
@@ -321,9 +316,7 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 	/*
 	 * Snapshot the dedup state BEFORE disconnect, because disconnect
 	 * may dissolve the dedup (rmap_count drops to 1) and restore
-	 * folio->mapping to the surviving owner's mapping. We must NOT
-	 * clear folio->mapping in that case — the folio is still live
-	 * in the survivor's XArray.
+	 * folio->mapping to the surviving owner's mapping.
 	 */
 	was_dedup = folio_test_dedup(folio);
 
@@ -346,9 +339,6 @@ void filemap_remove_folio_at(struct folio *folio, struct address_space *mapping,
 	} else if (folio->mapping == mapping) {
 		folio->mapping = NULL;
 	}
-	/* else: folio was dissolved and now belongs to another mapping —
-	 * do NOT null out folio->mapping. */
-
 	mapping->nrpages -= nr;
 
 	xa_unlock_irq(&mapping->i_pages);
@@ -429,8 +419,7 @@ void filemap_remove_folio(struct folio *folio)
 static void page_cache_delete_batch(struct address_space *mapping,
 			     struct folio_batch *fbatch)
 {
-	// XA_STATE(xas, &mapping->i_pages, fbatch->folios[0]->index);
-  XA_STATE(xas, &mapping->i_pages, folio_index_in(fbatch->folios[0], mapping));
+	XA_STATE(xas, &mapping->i_pages, folio_index_in(fbatch->folios[0], mapping));
 	long total_pages = 0;
 	int i = 0;
 	struct folio *folio;
@@ -2062,7 +2051,6 @@ struct folio *__filemap_get_folio(struct address_space *mapping, pgoff_t index,
 	struct folio *folio;
 
 repeat:
-	//pr_info("OOB DEDUP: filemap_get_folio called\n");
 	folio = filemap_get_entry(mapping, index);
 	if (xa_is_value(folio))
 		folio = NULL;
@@ -2079,10 +2067,7 @@ repeat:
 			folio_lock(folio);
 		}
 
-		/* Has the page been truncated? */
-	//pr_info("just before checking\n");
     if (unlikely(!folio_shares_mapping(folio,mapping))) {
-      // pr_info("__filemap_get_folio was called here and returned with error\n");
 			folio_unlock(folio);
 			folio_put(folio);
 			goto repeat;
@@ -2098,11 +2083,9 @@ repeat:
 			folio_clear_idle(folio);
 	}
 	
-	//if (folio_test_dedup(folio)) pr_info("OOB DEDUP: crash location candidate 1\n");
 	// we can skip this function as a deduped folio is never dirty
 	if ((fgp_flags & FGP_STABLE) && !folio_test_dedup(folio))
 		folio_wait_stable(folio);
-	//if (folio_test_dedup(folio)) pr_info("OOB DEDUP: cleared\n");
 no_page:
 	if (!folio && (fgp_flags & FGP_CREAT)) {
 		unsigned order = FGF_GET_ORDER(fgp_flags);
@@ -2287,13 +2270,6 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
 	rcu_read_lock();
 	while ((folio = find_get_entry(&xas, end, XA_PRESENT))) {
 		if (!xa_is_value(folio)) {
-      /*
-			if (folio->index < *start)
-				goto put;
-			if (folio_next_index(folio) - 1 > end)
-				goto put;
-      */
-      // new check to not break stuff actually.
       pgoff_t f_index = folio_index_in(folio, mapping);
 
       if (f_index < *start)
@@ -2306,8 +2282,6 @@ unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
 			if (!folio_shares_mapping(folio,mapping) ||
 			    folio_test_writeback(folio))
 				goto unlock;
-			// VM_BUG_ON_FOLIO(!folio_contains(folio, xas.xa_index),
-					// folio);
       VM_BUG_ON_FOLIO((xas.xa_index - f_index) >= folio_nr_pages(folio), folio);
 		}
 		indices[fbatch->nr] = xas.xa_index;
@@ -2370,12 +2344,7 @@ unsigned filemap_get_folios(struct address_space *mapping, pgoff_t *start,
 
 			if (folio_test_hugetlb(folio))
 				nr = 1;
-//			*start = folio->index + nr;
-//#ifdef CONFIG_OOB_DEDUP
       *start = folio_index_in(folio, mapping) + nr;
-//#else
-  //    *start = folio->index + nr;
-//#endif
 			goto out;
 		}
 	}
@@ -2564,20 +2533,6 @@ static void filemap_get_read_batch(struct address_space *mapping,
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
-		if (++_loop_iters > 100000) {
-			pr_err("OOB_DEDUP: [BATCH_LOOP] %lu iters! xa_index=%lu "
-				"index=%lu max=%lu batch_nr=%u "
-				"folio=%px folio_idx=%lu order=%u dedup=%d "
-				"inode=%lu\n",
-				_loop_iters, (unsigned long)xas.xa_index,
-				(unsigned long)index, (unsigned long)max,
-				folio_batch_count(fbatch),
-				folio, folio ? folio->index : 0,
-				folio ? folio_order(folio) : 0,
-				folio ? folio_test_dedup(folio) : 0,
-				mapping->host->i_ino);
-			break;
-		}
 		if (xas_retry(&xas, folio))
 			continue;
 		if (xas.xa_index > max || xa_is_value(folio))
@@ -2808,10 +2763,6 @@ retry:
 	if (!folio_batch_count(fbatch)) {
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
 			return -EAGAIN;
-		pr_info_ratelimited("OOB_DEDUP: [READ_DEBUG] empty batch at index %lu, "
-			"creating folio (inode %lu)\n",
-			(unsigned long)(iocb->ki_pos >> PAGE_SHIFT),
-			mapping->host->i_ino);
 		err = filemap_create_folio(filp, mapping,
 				iocb->ki_pos >> PAGE_SHIFT, fbatch);
 		if (err == AOP_TRUNCATED_PAGE)
@@ -2962,18 +2913,6 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 				flush_dcache_folio(folio);
 
 			copied = copy_folio_to_iter(folio, offset, bytes, iter);
-
-			if (copied == 0 && bytes == 0) {
-				pr_info_ratelimited("OOB_DEDUP: [READ_LOOP] zero copy at ki_pos=%lld "
-					"fsize=%zu offset=%zu end_off=%lld folio_idx=%lu "
-					"folio_order=%u dedup=%d inode=%lu iter_count=%zu\n",
-					iocb->ki_pos, fsize, offset, end_offset,
-					folio->index, folio_order(folio),
-					folio_test_dedup(folio),
-					mapping->host->i_ino,
-					iov_iter_count(iter));
-			}
-
 			already_read += copied;
 			iocb->ki_pos += copied;
 			last_pos = iocb->ki_pos;

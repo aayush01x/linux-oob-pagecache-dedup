@@ -82,24 +82,7 @@ def plot_exp2():
     ax2.set_title('Dedup Completion Time')
     savefig('plot2_scan_throughput.png')
 
-# ─── Plot 3: Read Latency Comparison ─────────────────────
-def plot_exp3():
-    rows = read_csv("exp3_read_latency.csv")
-    if not rows: return
-    sz = [int(r['size_mb']) for r in rows]
-    nr = [int(r['normal_read_ns']) / 1e6 for r in rows]
-    dr = [int(r['dedup_read_ns']) / 1e6 for r in rows]
-
-    plt.figure()
-    plt.plot(sz, nr, marker='o', color=COLORS[0], linestyle='--', label='Normal Read')
-    plt.plot(sz, dr, marker='s', color=COLORS[1], label='Deduped Read')
-    plt.xlabel('File Size (MB)')
-    plt.ylabel('Read Time (ms)')
-    plt.title('Read Latency: Normal vs Deduped (Page Cache Warm)')
-    plt.legend()
-    savefig('plot3_read_latency.png')
-
-# ─── Plot 4: Write / COW Latency ─────────────────────────
+# ─── Plot 4: Write / COW Latency ─────────────────────
 def plot_exp4():
     rows = read_csv("exp4_write_latency.csv")
     if not rows: return
@@ -176,22 +159,7 @@ def plot_exp6():
     ax2.legend(lines1 + lines2, l1 + l2)
     savefig('plot6_live_trace.png')
 
-# ─── Plot 7: Accounting Stability ────────────────────────
-def plot_exp7():
-    rows = read_csv("exp7_accounting.csv")
-    if not rows: return
-    cyc = [int(r['cycle']) for r in rows]
-    drift = [int(r['drift_kb']) for r in rows]
-
-    plt.figure(figsize=(8, 4))
-    plt.bar([str(c) for c in cyc], drift, color=COLORS[0], alpha=0.7)
-    plt.axhline(y=0, color='red', linestyle='--', linewidth=1)
-    plt.xlabel('Dedup-COW-Delete Cycle')
-    plt.ylabel('Cached Drift (KB)')
-    plt.title('NR_FILE_PAGES Accounting Stability (drift should be ~0)')
-    savefig('plot7_accounting_stability.png')
-
-# ─── Generate Markdown Report ────────────────────────────
+# ─── Generate Markdown Report ────────────────────────
 def generate_report():
     rpt = os.path.join(RESULTS_DIR, "profiling_report.md")
     with open(rpt, 'w') as f:
@@ -217,17 +185,7 @@ def generate_report():
                 f.write(f"| {r['size_mb']} | {int(r['dedup_time_ns'])//1000000} | {r['pages_scanned']} | {r['pages_deduped']} | {r['scan_rate_pages_per_sec']} |\n")
         f.write("\n![Throughput](plot2_scan_throughput.png)\n\n---\n\n")
 
-        f.write("## Experiment 3: Read Latency — Normal vs Deduped\n")
-        f.write("**Purpose**: Verify deduped reads have no overhead (same physical folio).\n\n")
-        rows = read_csv("exp3_read_latency.csv")
-        if rows:
-            f.write("| Size (MB) | Normal Read (ms) | Dedup Read (ms) | Normal (MB/s) | Dedup (MB/s) |\n")
-            f.write("|-----------|-----------------|----------------|---------------|-------------|\n")
-            for r in rows:
-                f.write(f"| {r['size_mb']} | {int(r['normal_read_ns'])//1000000} | {int(r['dedup_read_ns'])//1000000} | {r['normal_read_mbps']} | {r['dedup_read_mbps']} |\n")
-        f.write("\n![Read Latency](plot3_read_latency.png)\n\n---\n\n")
-
-        f.write("## Experiment 4: Write Latency — Normal vs COW\n")
+        f.write("## Experiment 3: Write Latency — Normal vs COW\n")
         f.write("**Purpose**: Quantify the COW overhead when writing to deduped folios.\n\n")
         rows = read_csv("exp4_write_latency.csv")
         if rows:
@@ -251,16 +209,6 @@ def generate_report():
         f.write("**Purpose**: Track scanner progress, memory reduction, and queue drain over time.\n\n")
         f.write("![Live Trace](plot6_live_trace.png)\n\n---\n\n")
 
-        f.write("## Experiment 7: NR_FILE_PAGES Accounting Stability\n")
-        f.write("**Purpose**: Verify that repeated dedup→COW→delete cycles don't leak NR_FILE_PAGES.\n\n")
-        rows = read_csv("exp7_accounting.csv")
-        if rows:
-            f.write("| Cycle | Before (KB) | After Delete (KB) | Drift (KB) |\n")
-            f.write("|-------|------------|-------------------|------------|\n")
-            for r in rows:
-                f.write(f"| {r['cycle']} | {r['cached_before_kb']} | {r['cached_after_delete_kb']} | {r['drift_kb']} |\n")
-        f.write("\n![Accounting](plot7_accounting_stability.png)\n\n")
-
     print(f"  -> {rpt}")
 
 # ─── Main ────────────────────────────────────────────────
@@ -268,11 +216,10 @@ if __name__ == '__main__':
     print("Generating graphs...")
     plot_exp1()
     plot_exp2()
-    plot_exp3()
     plot_exp4()
     plot_exp5()
     plot_exp6()
-    plot_exp7()
     print("Generating report...")
     generate_report()
     print("All done!")
+
