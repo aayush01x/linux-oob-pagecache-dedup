@@ -499,7 +499,6 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart,
 	}
 
 	index = start;
-	unsigned long loop2_spins = 0;
 	while (index < end) {
 		cond_resched();
 
