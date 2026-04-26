@@ -1003,7 +1003,7 @@ int oob_dedup_evict_inode(struct inode *inode)
 bool oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping, 
                      pgoff_t index, struct folio* folio)
 {
-	pr_info("OOB_DEDUP: entering remove function\n");
+	pr_debug("OOB_DEDUP: entering rmap remove\n");
     struct oob_dedup_rmap_entry *slot, *tmp;
     bool found = false;
     bool dissolve = false;
@@ -1071,7 +1071,7 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
     new_folio->index = index;
     // copy the folio and data
     folio_copy(new_folio, old_folio);
-    pr_info("OOB_DEDUP: copied the old data\n");
+    pr_debug("OOB_DEDUP: COW break: copied folio data\n");
     __folio_mark_uptodate(new_folio);
 
     folio_lock(new_folio);
@@ -1090,59 +1090,56 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         return -EAGAIN;
     }
 
-	pr_info("OOB_DEDUP: before switch \n OOB_DEDUP: ref count old folio %d\n", folio_ref_count(old_folio));
-	pr_info("OOB_DEDUP: ref count new folio %d\n", folio_ref_count(new_folio));
-    // xarray update
-    
+	pr_debug("OOB_DEDUP: COW break: old refcount %d, new refcount %d\n",
+		 folio_ref_count(old_folio), folio_ref_count(new_folio));
+
     old_pfn = folio_pfn(old_folio);
     new_pfn = folio_pfn(new_folio);
     xas_set_order(&xas, index, folio_order(new_folio));
     xas_store(&xas, new_folio);
     if (xas_error(&xas)) {
-        pr_info("OOB_DEDUP: unsucessful replacement\n");
+        pr_warn("OOB_DEDUP: COW break xas_store failed\n");
         spin_unlock(&info->lock);
         xas_unlock_irq(&xas);
         folio_unlock(new_folio);
         folio_put(new_folio);
         return xas_error(&xas);
-    }else {
-        __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
-        if (folio_test_pmd_mappable(new_folio))
-            __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
-
-        struct folio *check_folio = xas_load(&xas); 
-        unsigned long check_pfn = check_folio ? folio_pfn(check_folio) : 0;
-
-        if (check_pfn == new_pfn) {
-            pr_info("OOB_DEDUP: [SUCCESS] Swapped PFN %lx -> %lx at index %lu\n", 
-                     old_pfn, new_pfn, index);
-        } else {
-            pr_err("OOB_DEDUP: [CRITICAL] XArray verify failed! Found PFN %lx, expected %lx\n",
-                    check_pfn, new_pfn);
-        }
     }
-    pr_info("Folio Flags for old folio:   0x%lx\n", old_folio->flags);
-    pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);
-    pr_info("OOB_DEDUP: after switch \n OOB_DEDUP: ref count old folio, expected is %d\n", folio_ref_count(old_folio));
-	pr_info("OOB_DEDUP: ref count new folio, expectation same %d\n", folio_ref_count(new_folio));
-	pr_info("check after chaning flags\n");
-    pr_info("Folio Flags for old folio:   0x%lx\n", old_folio->flags);
-    pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);	
+
+    __lruvec_stat_mod_folio(new_folio, NR_FILE_PAGES, folio_nr_pages(new_folio));
+    if (folio_test_pmd_mappable(new_folio))
+        __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
+
+    pr_debug("OOB_DEDUP: [SUCCESS] COW break PFN %lx -> %lx at index %lu\n",
+             old_pfn, new_pfn, index);
+
 
     // remove the info about the folio from the list
     dissolve = oob_rmap_remove(info, mapping, index, old_folio);
-    pr_info("OOB_DEDUP: not printing oob_rmap remove entering pr_info?\n");
-    folio_put(old_folio);
-      
-       spin_unlock(&info->lock);
-       if(dissolve){
-        kmem_cache_free(dedup_info_cache,info);}
-       xas_unlock_irq(&xas);
-    // state management
-    folio_get(new_folio);  // for xas store accounting
+
+    spin_unlock(&info->lock);
+    xas_unlock_irq(&xas);
+
+    if (dissolve)
+        kmem_cache_free(dedup_info_cache, info);
+
+    /* Add new_folio to LRU — alloc gave us 1 ref, xas_store holds it in
+     * the page cache.  No extra folio_get needed. */
     folio_add_lru(new_folio);
-    
+
+    /*
+     * Drop the page-cache refs that the old dedup XArray entry held.
+     * deduplicate_folio() added folio_nr_pages refs when it stored
+     * old_folio into this mapping's XArray.  xas_store(new_folio)
+     * replaced the entry but does not drop those refs automatically.
+     */
+    folio_put_refs(old_folio, folio_nr_pages(old_folio));
+
+    /* Unlock old_folio — the caller locked it via __filemap_get_folio.
+     * Must unlock BEFORE the final put in case this put frees it. */
     folio_unlock(old_folio);
+
+    /* Drop the caller's lookup reference on old_folio */
     folio_put(old_folio);
 
     *foliop = new_folio;
