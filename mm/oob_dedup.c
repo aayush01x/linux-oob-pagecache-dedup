@@ -46,7 +46,6 @@ static atomic_t stat_folios_split = ATOMIC_INIT(0);
 
 static unsigned int merge_threshold_pct = 50;
 
-
 static struct oob_scan oob_scan = {
     .slot = NULL,
     .pgoff = 0,
@@ -54,7 +53,6 @@ static struct oob_scan oob_scan = {
 };
 
 static DEFINE_HASHTABLE(oob_folio_hash, 12);
-
 
 
 /* Legacy: full-folio hash, superseded by anchor hashing.
@@ -90,7 +88,6 @@ static u32 hash_page_at(struct folio *folio, unsigned int page_idx)
 }
 
 /*
- * Phase 2: Zero-page short circuit.
  * Returns true if the first page of the folio is entirely zeros.
  */
 static bool folio_first_page_is_zero(struct folio *folio)
@@ -105,7 +102,6 @@ static bool folio_first_page_is_zero(struct folio *folio)
 }
 
 /*
- * Phase 3: Dynamic anchor geometry.
  * Computes stride, anchor count, and evasion offset from the
  * merge_threshold_pct tunable and the folio's page count.
  */
@@ -166,13 +162,6 @@ static unsigned int compare_folios_count(struct folio *f1, struct folio *f2)
 	return matched;
 }
 
-// static bool compare_folios(struct folio *f1, struct folio *f2)
-// {
-// 	if (folio_nr_pages(f1) != folio_nr_pages(f2))
-// 		return false;
-// 	return compare_folios_count(f1, f2) == folio_nr_pages(f1);
-// }
-
 static void clean_folio_hashtable(void)
 {
     struct page_entry *entry;
@@ -219,14 +208,6 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         if (!folio_trylock(orig_folio)) { folio_unlock(dup_folio); err = -EAGAIN; goto out_free; }
     }
 
-    
-    /*
-     * MUahahaha
-     * checks to only have very clean folios deduplicated
-     * no folios in write backs 
-     * no folios in reads 
-     * and no dirty folios 
-     * */
     if (!folio_test_uptodate(orig_folio) || !folio_test_uptodate(dup_folio) ||
         folio_test_dirty(orig_folio) || folio_test_dirty(dup_folio) ||
         folio_test_writeback(orig_folio) || folio_test_writeback(dup_folio) ||
@@ -333,13 +314,6 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     }
     xas_unlock_irq(&xas);
     folio_put_refs(dup_folio, folio_nr_pages(dup_folio));
-
-    /*
-     * Subtract NR_FILE_PAGES for the dup_folio we just orphaned.
-     * Do NOT add NR_FILE_PAGES for orig_folio — it was already counted
-     * when it was first inserted into its own page cache.  Adding it
-     * again would inflate the stat and mask all memory savings.
-     */
     lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));
     if (folio_test_pmd_mappable(dup_folio))
         lruvec_stat_mod_folio(dup_folio, NR_FILE_THPS, -folio_nr_pages(dup_folio));
@@ -364,9 +338,6 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
 
     folio_unlock(dup_folio);
     folio_unlock(orig_folio);
-
-    pr_info("OOB_DEDUP: dup_folio pfn = %lx refcount after dedup = %d \n",
-        folio_pfn(dup_folio), folio_ref_count(dup_folio));
 
     atomic_inc(&stat_pages_deduped);
     return 0;
@@ -402,16 +373,9 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
         n_anchors = 1;
         anchor_hashes[0] = hash_page_at(folio, 0);
         anchor_positions[0] = 0;
-        pr_info("OOB_DEDUP: [ANCHOR] order-0 folio at index %lu, hash=0x%08x\n",
-                index, anchor_hashes[0]);
     } else {
         geo = compute_anchor_geometry(nr);
         n_anchors = geo.anchor_count;
-
-        pr_info("OOB_DEDUP: [ANCHOR] large folio order=%u nr_pages=%lu at index %lu | "
-                "stride=%u count=%u evasion=%u\n",
-                folio_order(folio), nr, index,
-                geo.stride, geo.anchor_count, geo.evasion_off);
 
         for (i = 0; i < n_anchors; i++) {
             unsigned int pos = geo.evasion_off + i * geo.stride;
@@ -419,8 +383,6 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
                 pos = nr - 1;  /* clamp to last page */
             anchor_positions[i] = pos;
             anchor_hashes[i] = hash_page_at(folio, pos);
-            pr_info("OOB_DEDUP: [ANCHOR]   anchor[%u] page=%u hash=0x%08x\n",
-                    i, pos, anchor_hashes[i]);
         }
     }
 
@@ -432,9 +394,6 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
      */
     for (i = 0; i < n_anchors && !found; i++) {
         u32 hash = anchor_hashes[i];
-        pr_info("OOB_DEDUP: [ANCHOR] searching hash table for anchor[%u] hash=0x%08x\n",
-                i, hash);
-
         spin_lock(&folio_hash_lock);
         hash_for_each_possible_safe(oob_folio_hash, entry, tmp, node, hash) {
             if (entry->hash != hash)
@@ -460,10 +419,6 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
 
                 if (folio_order(orig_folio) == folio_order(folio)) {
                     unsigned int matched = compare_folios_count(orig_folio, folio);
-                    pr_info("OOB_DEDUP: [ANCHOR] anchor[%u] HIT! candidate inode %lu index %lu | "
-                            "full compare: %u/%lu pages match\n",
-                            i, entry_mapping->host->i_ino, entry_index, matched, nr);
-
                     if (matched == nr) {
                         pr_info("Exact duplicate verified! (anchor %u hit)\n", i);
                         pr_info("Match -> Inode 1: %lu (Index %lu) | Inode 2: %lu (Index %lu) | Order: %d\n",
@@ -521,8 +476,6 @@ static void check_and_store_folio(struct folio *folio, struct address_space *map
      * so future folios can match against this one.
      */
     if (!found) {
-        pr_info("OOB_DEDUP: [ANCHOR] no match for inode %lu index %lu — storing %u anchor entries\n",
-                mapping->host->i_ino, index, n_anchors);
         spin_lock(&folio_hash_lock);
         for (i = 0; i < n_anchors; i++) {
             entry = kmalloc(sizeof(struct page_entry), GFP_ATOMIC);
@@ -585,10 +538,6 @@ static void oob_dedup_do_scan(void)
         inode = igrab(inode); /* Safely attempt to grab the inode */
 
         if (!inode) {
-            /*
-             * BUG-13 fix: inode is being deleted — advance past this slot
-             * to avoid spinning forever on a dying inode.
-             */
             struct file_dedup_slot *next = list_next_entry(slot, list);
             if (list_is_head(&next->list, &file_dedup_list))
                 oob_scan.slot = NULL;
@@ -618,9 +567,7 @@ static void oob_dedup_do_scan(void)
                         slot_mapping->host->i_ino);
 
                 /*
-                 * Skip folios that are already deduped — their mapping
-                 * pointer is tagged and must not be passed to code that
-                 * dereferences it as a plain address_space*.
+                 * Skip folios that are already deduped
                  */
                 if (folio_test_dedup(folio)) {
                     folio_put(folio);
@@ -640,14 +587,8 @@ static void oob_dedup_do_scan(void)
                     continue;
                 }
 
-                /*
-                 * Phase 1: I/O Veto — skip folios under active I/O.
-                 * Do NOT advance cursor so scanner retries next round.
-                 */
                 if (folio_test_dirty(folio) ||
                     folio_test_writeback(folio)) {
-                    pr_info("OOB_DEDUP: [VETO] skipping dirty/writeback folio at pgoff %lu (nr=%lu), will retry\n",
-                            folio_start, nr);
                     folio_put(folio);
                     slot_pages_done += nr;
                     pages_done += nr;
@@ -655,14 +596,7 @@ static void oob_dedup_do_scan(void)
                     continue;
                 }
 
-                /*
-                 * Phase 2: Zero-page short circuit — skip folios whose
-                 * first page is entirely zeros to prevent hash table
-                 * hot-bucket pathology.
-                 */
                 if (folio_first_page_is_zero(folio)) {
-                    pr_info("OOB_DEDUP: [ZERO] skipping all-zero folio at pgoff %lu (nr=%lu)\n",
-                            folio_start, nr);
                     folio_put(folio);
                     slot->pgoff = folio_start + nr;
                     slot_pages_done += nr;
@@ -678,7 +612,6 @@ static void oob_dedup_do_scan(void)
                  */
                 pgoff_t pgoff_before = slot->pgoff;
 
-                /* BUG-27 fix: pass folio base index, not slot->pgoff */
                 check_and_store_folio(folio, slot_mapping, folio_start);
                 folio_put(folio);
 
@@ -696,13 +629,6 @@ static void oob_dedup_do_scan(void)
                 pages_done += nr;
                 atomic_add(nr, &stat_pages_scanned);
             } else {
-                /* Page not in cache — scanner skips silently.
-                 * Log once per slot to help diagnose empty-cache issues.
-                 */
-                if (slot_pages_done == 0)
-                    pr_info("OOB_DEDUP: [SCAN] cache miss at pgoff %lu for inode %lu "
-                            "(pages may not be in cache)\n",
-                            slot->pgoff, slot_mapping->host->i_ino);
                 slot->pgoff++;
                 slot_pages_done++;
                 pages_done++;
@@ -829,8 +755,6 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
              * here (inside xa_lock_irq), so use folio_put_refs.
              */
             folio_put_refs(folio, folio_nr_pages(folio));
-            /* Folio is leaving the page cache entirely —
-             * both XArray entries are cleared. */
             folio->mapping = NULL;
         } else {
             /* Cross-file dissolution: folio survives in the
@@ -842,10 +766,6 @@ void oob_dedup_disconnect_folio(struct folio *folio, struct address_space *mappi
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
     } else if (info->rmap_count == 0) {
-        /*
-         * All rmap entries removed — this shouldn't normally happen,
-         * but handle it gracefully to avoid leaking the info struct.
-         */
         folio->mapping = NULL;
         dissolve = true;
     }
@@ -900,7 +820,6 @@ static ssize_t merge_threshold_pct_store(struct kobject *kobj, struct kobj_attri
 {
     unsigned int val;
     if (kstrtouint(buf, 10, &val) == 0) {
-        /* Clamp to [1, 100]: 0 would split every large folio; >100 is nonsensical. */
         if (val < 1)   val = 1;
         if (val > 100) val = 100;
         merge_threshold_pct = val;
@@ -1022,7 +941,6 @@ int oob_dedup_add_file(struct address_space *mapping)
             file_dedup_slot_insert(file_dedup_hash, mapping, slot);
             list_add_tail(&slot->list, &file_dedup_list);
             atomic_inc(&stat_files_queued);
-        // ihold(mapping->host);
 			pr_info("OOB_DEDUP: Queued file for dedup. Inode: %lu, Mapping: %p\n",mapping->host->i_ino, mapping);
             oob_dedup_wakeup();
         } else {
@@ -1034,112 +952,6 @@ int oob_dedup_add_file(struct address_space *mapping)
     spin_unlock(&file_dedup_lock);
     return err;
 }
-// int oob_dedup_evict_inode(struct inode *inode)
-// {
-// 	pr_debug("OOB_DEDUP: ENTERING EVICT NODE FUCTION\n");
-// 	dump_stack();
-//     struct page_entry *entry;
-//     struct hlist_node *tmp;
-//     int bkt;
-//     bool found_in_hash = false;
-//     bool found_in_file_hash = false;
-//     struct file_dedup_slot *slot;
-//     struct address_space *mapping = inode->i_mapping;
-//     struct folio* folio;
-//     XA_STATE(xas, &mapping->i_pages, 0);
-//
-//     spin_lock(&file_dedup_lock);
-//
-//     if (mapping) {
-//         slot = file_dedup_slot_lookup(file_dedup_hash, inode->i_mapping);
-//         if (slot) {
-//             if (oob_scan.slot == slot) {
-//                 struct file_dedup_slot *next = list_next_entry(slot, list);
-//                 if (list_is_head(&next->list, &file_dedup_list))
-//                     oob_scan.slot = NULL;
-//                 else
-//                     oob_scan.slot = next;
-//                 oob_scan.pgoff = 0;
-//             }
-//
-//             list_del(&slot->list);
-//             atomic_dec(&stat_files_queued);
-//             hash_del(&slot->hash);
-//             file_dedup_slot_free(file_dedup_cache, slot);
-//             found_in_file_hash = true;
-//         }
-//     }
-//     spin_unlock(&file_dedup_lock);
-//
-//     spin_lock(&folio_hash_lock);
-//     hash_for_each_safe(oob_folio_hash, bkt, tmp, entry, node) {
-//         if (entry->mapping && entry->mapping->host == inode) {
-//             hash_del(&entry->node);
-//             kfree(entry);
-//             found_in_hash = true;
-//         }
-//     }
-//     spin_unlock(&folio_hash_lock);
-//
-//     if (!mapping) return 0;
-//
-//     /* clean up deduped folios and handle dissolution */
-//     xas_lock_irq(&xas);
-//     xas_for_each(&xas, folio, ULONG_MAX) {
-//         if (xas_retry(&xas, folio)) continue;
-//         if (!folio_test_dedup(folio)) continue;
-//
-//         // lock the folio first to safely change its identity lest we might result in deadlock
-//         if (!folio_trylock(folio)) {
-//             continue; 
-//         }
-//
-//         struct oob_dedup_info *info = folio_dedup_info(folio);
-//         struct oob_dedup_rmap_entry *entry, *tmp_entry;
-//         bool dissolve = false;
-//
-//         spin_lock(&info->lock);
-//         list_for_each_entry_safe(entry, tmp_entry, &info->rmap_list, list) {
-//             if (entry->mapping == mapping) {
-//                 list_del(&entry->list);
-//                 info->rmap_count--;
-//                 kmem_cache_free(rmap_entry_cache, entry);
-//             }
-//         }
-//
-//         // if after removal of the peer we are left with only one entry
-//         // we just reinstantiate it as a proper folio 
-//         if (info->rmap_count == 1) {
-//             struct oob_dedup_rmap_entry *last = list_first_entry(&info->rmap_list, 
-//                                                struct oob_dedup_rmap_entry, list);
-//
-//             folio->mapping = last->mapping;
-//             folio->index = last->index;
-//
-//             list_del(&last->list);
-//             kmem_cache_free(rmap_entry_cache, last);
-//             dissolve = true; 
-//         }
-//
-//         spin_unlock(&info->lock);
-//
-//         if (dissolve) {
-//             kmem_cache_free(dedup_info_cache, info);
-//         }
-//
-//         folio_unlock(folio);
-//     }
-//     xas_unlock_irq(&xas);
-//
-//     // if (found_in_file_hash) {
-//     //   iput(inode);
-//     //}
-//
-//     // if (found_in_hash) {
-//     //     pr_info("OOB_DEDUP: Cleaned up entries corresponding to deleted Inode %lu from hash table.\n", inode->i_ino);
-//     // }
-//     return 0;
-// }
 
 int oob_dedup_evict_inode(struct inode *inode)
 {
@@ -1193,10 +1005,8 @@ bool oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping,
 {
 	pr_info("OOB_DEDUP: entering remove function\n");
     struct oob_dedup_rmap_entry *slot, *tmp;
-    // unsigned  long flags;
     bool found = false;
     bool dissolve = false;
-    //spin_lock_irqsave(&info->lock, flags);
     list_for_each_entry_safe(slot, tmp, &info->rmap_list, list) {
         if (slot->mapping == mapping && slot->index == index) {
             list_del(&slot->list);
@@ -1224,15 +1034,7 @@ bool oob_rmap_remove(struct oob_dedup_info *info, struct address_space *mapping,
         kmem_cache_free(rmap_entry_cache, last);
         dissolve = true;
     }
-    //spin_unlock_irqrestore(&info->lock, flags);
-	
 	return dissolve;
-
-
-        //
-    // if (info->rmap_count == 1) {
-    //     pr_debug("OOB_DEDUP: Hub %p now has only one owner left.\n", info);
-    // }
 }
 
 
@@ -1308,16 +1110,6 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
         if (folio_test_pmd_mappable(new_folio))
             __lruvec_stat_mod_folio(new_folio, NR_FILE_THPS, folio_nr_pages(new_folio));
 
-        /*
-         * Do NOT decrement NR_FILE_PAGES for old_folio here.
-         * old_folio is still live in another file's (or this file's)
-         * XArray at its original index.  Its NR_FILE_PAGES +1 was
-         * counted once at initial load.  The shared B[0] entry never
-         * incremented NR (deduplicate_folio deliberately skips it),
-         * so un-sharing via COW must not decrement either.
-         */
-
-        /* VERIFICATION BLOCK */
         struct folio *check_folio = xas_load(&xas); 
         unsigned long check_pfn = check_folio ? folio_pfn(check_folio) : 0;
 
@@ -1333,10 +1125,6 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
     pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);
     pr_info("OOB_DEDUP: after switch \n OOB_DEDUP: ref count old folio, expected is %d\n", folio_ref_count(old_folio));
 	pr_info("OOB_DEDUP: ref count new folio, expectation same %d\n", folio_ref_count(new_folio));
-
-	//folio_mark_dirty(new_folio);
-	//folio_clear_dirty(old_folio);
-	
 	pr_info("check after chaning flags\n");
     pr_info("Folio Flags for old folio:   0x%lx\n", old_folio->flags);
     pr_info("Folio Flags for new folio:   0x%lx\n", new_folio->flags);	
@@ -1350,12 +1138,6 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
        if(dissolve){
         kmem_cache_free(dedup_info_cache,info);}
        xas_unlock_irq(&xas);
-        
-   
-
-  
- 
-
     // state management
     folio_get(new_folio);  // for xas store accounting
     folio_add_lru(new_folio);
@@ -1369,11 +1151,7 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
 
 
 EXPORT_SYMBOL_GPL(oob_dedup_add_file);
-// EXPORT_SYMBOL_GPL(oob_dedup_remove_file);
 EXPORT_SYMBOL_GPL(oob_dedup_evict_inode);
 EXPORT_SYMBOL_GPL(oob_folio_break_dedup);
 subsys_initcall(oob_dedup_init);
 
-#ifdef CONFIG_KUNIT
-#include "tests/test_functionality.c"
-#endif
