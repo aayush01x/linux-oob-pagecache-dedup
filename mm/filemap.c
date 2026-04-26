@@ -2583,7 +2583,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
 			break;
 		if (folio_test_readahead(folio))
 			break;
-		xas_advance(&xas, folio_next_index(folio) - 1);
+		xas_advance(&xas, xas.xa_index + folio_nr_pages(folio) - 1);
 		continue;
 put_folio:
 		folio_put(folio);
@@ -2933,7 +2933,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 					     fsize - offset);
 			size_t copied;
 
-			if (end_offset < folio_pos(folio))
+			if (end_offset < folio_pos_in(folio, mapping))
 				break;
 			if (i > 0)
 				folio_mark_accessed(folio);
