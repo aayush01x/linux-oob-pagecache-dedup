@@ -324,7 +324,16 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
         mem_cgroup_uncharge(dup_folio);
     }
 #endif
-    
+
+    /*
+     * Cancel any dirty/writeback state before orphaning.
+     * The folio is locked so no new writeback can start, but
+     * cancel_dirty prevents the writeback path from picking it up
+     * after we clear the mapping.
+     */
+    folio_cancel_dirty(dup_folio);
+    folio_clear_uptodate(dup_folio);
+
     if (folio_test_lru(dup_folio)) {
         if (folio_isolate_lru(dup_folio)) {
             /* isolate took a ref; drop it now */
