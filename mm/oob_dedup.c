@@ -611,7 +611,15 @@ static void oob_dedup_do_scan(void)
             folio = filemap_get_folio(slot_mapping, slot->pgoff);
             if (!IS_ERR(folio)) {
                 long nr = folio_nr_pages(folio);
-                pgoff_t folio_start = folio_index(folio);
+                /* 
+                 * BUG FIX: Do not use folio_index(folio) here. For deduped
+                 * folios, folio->index is the index in the original mapping,
+                 * which could be 0 even if we are at slot->pgoff 256.
+                 * This would cause slot->pgoff to rewind to 0+256=256 infinitely.
+                 * Instead, page cache folios are naturally aligned, so we can
+                 * compute the base index in the current mapping.
+                 */
+                pgoff_t folio_start = slot->pgoff & ~(nr - 1);
 
                 pr_info("OOB_DEDUP: [SCAN] found folio at pgoff %lu, order=%u nr=%lu inode=%lu\n",
                         folio_start, folio_order(folio), nr,

@@ -260,8 +260,57 @@ bool truncate_inode_partial_folio(struct folio *folio, loff_t start, loff_t end)
 {
 	struct address_space *mapping = folio_mapping(folio);
 	pgoff_t target_index = start >> PAGE_SHIFT;
-	loff_t pos = folio_pos_near(folio, mapping, target_index);
+	loff_t pos;
 	unsigned int offset, length;
+
+	/*
+	 * Deduped folio: folio->mapping is a tagged oob_dedup_info pointer,
+	 * NOT a valid address_space*.  We cannot:
+	 *   1. Zero the folio data — it is shared with other files.
+	 *   2. Split the folio — split_huge_page_to_list() dereferences
+	 *      folio->mapping->i_pages which would GPF on the tagged pointer.
+	 *
+	 * Instead, just remove this mapping's reference to the shared folio
+	 * entirely.  The folio survives in other mappings that still reference
+	 * it through the rmap list.
+	 *
+	 * We recover the real mapping from the caller's context:
+	 * truncate_inode_pages_range() always calls __filemap_get_folio(mapping, ...)
+	 * so the folio is definitely present at target_index in the caller's mapping.
+	 */
+	if (unlikely(folio_test_dedup(folio))) {
+		struct oob_dedup_info *info = folio_dedup_info(folio);
+		struct oob_dedup_rmap_entry *entry;
+		struct address_space *real_mapping = NULL;
+
+		spin_lock(&info->lock);
+		list_for_each_entry(entry, &info->rmap_list, list) {
+			if (target_index >= entry->index &&
+			    target_index < entry->index + folio_nr_pages(folio)) {
+				real_mapping = entry->mapping;
+				target_index = entry->index;
+				break;
+			}
+		}
+		spin_unlock(&info->lock);
+
+		if (!real_mapping) {
+			/* Fallback: use the first rmap entry's mapping */
+			spin_lock(&info->lock);
+			entry = list_first_entry(&info->rmap_list,
+						 struct oob_dedup_rmap_entry, list);
+			real_mapping = entry->mapping;
+			target_index = entry->index;
+			spin_unlock(&info->lock);
+		}
+
+		folio_wait_writeback(folio);
+		truncate_cleanup_folio(folio);
+		filemap_remove_folio_at(folio, real_mapping, target_index);
+		return true;
+	}
+
+	pos = folio_pos_near(folio, mapping, target_index);
 
 	if (pos < start)
 		offset = start - pos;
