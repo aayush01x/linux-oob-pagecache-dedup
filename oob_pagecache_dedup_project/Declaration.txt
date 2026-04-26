@@ -1,0 +1,7 @@
+Anjali Patra 230148 25%
+Anirudh Singh 230142 25%
+Aayush Anand 230025 25%
+Kshitij Gupta 230581 25%
+
+
+"All project members own and give their consent on everything submitted as part of this submission. The work done and submitted in the project are done by the members of the project group mentioned above. Any use of external sources such as source code from other repositories, GPT generated source code/documentation/Figures etc. are properly attributed."
