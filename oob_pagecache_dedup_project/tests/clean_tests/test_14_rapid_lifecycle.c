@@ -1,10 +1,10 @@
 /*
- * test_rapid_dedup_delete.c
+ * test_14_rapid_lifecycle.c
  *
- * RAPID DEDUP-AND-DELETE CYCLE TEST
+ * RAPID DEDUP LIFECYCLE TEST
  *
- * This test hammers the dedup+delete path in rapid succession to expose
- * races between the scanner thread and file deletion:
+ * Exercises the create-dedup-delete path in rapid succession to validate
+ * correct handling of races between the scanner thread and file deletion:
  *
  *   1. In a tight loop (20 iterations):
  *      a. Create 2 identical files (8 pages each).

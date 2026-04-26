@@ -1,5 +1,5 @@
 /*
- * test_truncate_deduped.c
+ * test_02_truncate_deduped.c
  *
  * Truncate a deduped file, then verify the other file still reads correctly.
  * Directly exercises truncate_inode_pages_range + oob_dedup_disconnect_folio.

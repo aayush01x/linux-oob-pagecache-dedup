@@ -1,5 +1,5 @@
 /*
- * test_delete_then_read.c
+ * test_03_delete_then_read.c
  *
  * Delete one of two deduped files, then read the surviving file and verify
  * data is intact. The existing test_delete.c only checks that deletion

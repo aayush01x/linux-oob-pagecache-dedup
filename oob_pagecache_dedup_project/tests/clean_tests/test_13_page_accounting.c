@@ -1,7 +1,7 @@
 /*
- * test_nr_file_pages_leak.c
+ * test_13_page_accounting.c
  *
- * NR_FILE_PAGES STAT UNDERFLOW TEST
+ * PAGE ACCOUNTING CORRECTNESS VERIFICATION
  *
  * Bug: deduplicate_folio() decrements NR_FILE_PAGES for the dup_folio:
  *   lruvec_stat_mod_folio(dup_folio, NR_FILE_PAGES, -folio_nr_pages(dup_folio));

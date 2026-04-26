@@ -1,5 +1,5 @@
 /*
- * test_anchor_partial_match.c
+ * test_16_anchor_partial_match.c
  *
  * Tests the anchor-based hashing partial match detection.
  * Creates two large files that are ALMOST identical (differ by 1 page),

@@ -1,7 +1,7 @@
 /*
- * test_concurrent_trunc_cow.c
+ * test_09_concurrent_trunc_cow.c
  *
- * CONCURRENT TRUNCATION + COW STRESS TEST
+ * CONCURRENT TRUNCATION + COW CORRECTNESS TEST
  *
  * This is designed to hit the race window between truncate_inode_pages_range
  * and the COW break_dedup write path simultaneously:
@@ -202,7 +202,7 @@ wait_children:;
 
     /* --- 6. Cleanup --------------------------------------------------- */
     if (ret == 0)
-        printf("\n[PASS] Concurrent truncate + COW stress test passed\n");
+        printf("\n[PASS] Concurrent truncate + COW test passed\n");
 
 out:
     free(blk);

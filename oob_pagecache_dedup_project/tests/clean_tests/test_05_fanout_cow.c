@@ -1,5 +1,5 @@
 /*
- * test_fanout_cow.c
+ * test_05_fanout_cow.c
  *
  * 3 files share one folio. Write to file 1. Verify files 2 and 3 are
  * unaffected and still share the original folio. Tests rmap_count > 2

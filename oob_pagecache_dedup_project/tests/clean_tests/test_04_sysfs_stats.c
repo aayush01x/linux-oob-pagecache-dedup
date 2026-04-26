@@ -1,5 +1,5 @@
 /*
- * test_sysfs_stats_auto.c
+ * test_04_sysfs_stats.c
  *
  * Automated sysfs stats test: run a dedup workload, then read
  * /sys/kernel/oob_dedup/pages_deduped and assert it is > 0.

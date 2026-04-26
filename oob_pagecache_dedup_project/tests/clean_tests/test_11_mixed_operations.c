@@ -1,25 +1,23 @@
 /*
- * test_mixed_ops_torture.c
+ * test_11_mixed_operations.c
  *
- * MIXED OPERATIONS TORTURE TEST
+ * COMBINED OPERATIONS CORRECTNESS TEST
  *
- * The ultimate stress test — combines EVERY edge case into one scenario:
+ * Validates correct behavior when multiple dedup-related operations
+ * are performed in combination within a single test scenario:
  *
- *   - Inter-file dedup (files A, B, C share content)
- *   - Intra-file dedup (file D has duplicate pages within itself)
+ *   - Inter-file deduplication (files A, B, C share content)
+ *   - Intra-file deduplication (file D has duplicate pages internally)
  *   - Hole-punching (fallocate FALLOC_FL_PUNCH_HOLE on file A)
- *   - Partial truncation (truncate file B to mid-page boundary)
- *   - COW writes on file C while D is being deleted
- *   - Read verification on survivors throughout
- *   - Full cleanup (all files deleted, nrpages must be 0)
+ *   - Partial truncation (truncate file B to a mid-page boundary)
+ *   - COW writes on file C concurrent with deletion of file D
+ *   - Read verification on surviving files after each operation
+ *   - Full cleanup (all files deleted, nrpages must return to 0)
  *
- * This test is designed so that if ANY of these operations
- * has an off-by-one in nrpages, a stale rmap, a wrong XArray
- * slot removal, or a folio leak, it will manifest as either:
- *   - Data corruption (read verification fails)
- *   - Kernel BUG (clear_inode sees nrpages != 0)
- *   - Kernel NULL pointer dereference (bad mapping pointer)
- *   - Infinite loop in truncate_inode_pages_range
+ * This test exercises interactions between dedup state management,
+ * XArray manipulation, rmap bookkeeping, and memory accounting.
+ * Any inconsistency in these subsystems will manifest as data
+ * corruption, kernel assertion failure, or infinite loop.
  *
  * Exit: 0 = PASS, 1 = FAIL
  */
@@ -108,7 +106,7 @@ int main(void)
     long intra_size = (long)PAGE_SIZE * INTRA_PAGES;
     int fd;
 
-    printf("TEST: Mixed Operations Torture\n");
+    printf("TEST: Combined Operations Correctness\n");
     printf("  (inter-file dedup + intra-file dedup + hole-punch + "
            "partial truncate + COW + delete)\n\n");
 
@@ -293,7 +291,7 @@ int main(void)
     printf("  -> All files deleted without kernel panic\n");
 
     if (ret == 0)
-        printf("\n[PASS] Mixed operations torture test passed\n");
+        printf("\n[PASS] Combined operations correctness test passed\n");
 
 out:
     free(blk_inter);

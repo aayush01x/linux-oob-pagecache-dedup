@@ -1,5 +1,5 @@
 /*
- * test_cow_during_truncate.c
+ * test_15_cow_during_truncate.c
  *
  * COW WRITE DURING ACTIVE TRUNCATION — targets oob_folio_break_dedup bugs
  *

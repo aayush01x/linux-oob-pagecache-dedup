@@ -1,5 +1,5 @@
 /*
- * test_redeup_after_cow.c
+ * test_10_rededup_after_cow.c
  *
  * RE-DEDUP AFTER COW BREAK TEST
  *

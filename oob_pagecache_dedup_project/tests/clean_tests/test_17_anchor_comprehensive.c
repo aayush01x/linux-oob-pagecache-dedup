@@ -1,11 +1,12 @@
 /*
- * test_anchor_stress.c
+ * test_17_anchor_comprehensive.c
  *
- * Comprehensive stress test for anchor-based hashing, partial match
+ * COMPREHENSIVE ANCHOR HASHING VALIDATION
+ *
+ * End-to-end validation of anchor-based hashing, partial match
  * detection, COW isolation, truncation, and deletion under dedup.
  *
- * Creates a constellation of files with varying similarity levels and
- * then hammers every code path: exact dedup, partial-match split,
+ * Creates files with varying similarity levels and validates
  * zero-page skip, COW break, truncation of shared folios, deletion
  * from dedup chains, re-dedup after COW, and NR_FILE_PAGES accounting.
  *
@@ -263,7 +264,7 @@ static long read_cached_kb(void)
 int main(void)
 {
     printf("============================================================\n");
-    printf("  ANCHOR HASHING STRESS TEST\n");
+    printf("  ANCHOR HASHING COMPREHENSIVE VALIDATION\n");
     printf("============================================================\n\n");
 
     /* ================================================================== */
@@ -630,7 +631,7 @@ int main(void)
     /* ================================================================== */
     printf("============================================================\n");
     if (fail_count == 0) {
-        printf("  [PASS] Anchor stress test — ALL CHECKS PASSED\n");
+        printf("  [PASS] Anchor comprehensive test — ALL CHECKS PASSED\n");
         printf("    Exact dedup:     verified\n");
         printf("    Partial match:   verified (1-page + 5-page + 50%% diffs)\n");
         printf("    Zero-page skip:  exercised\n");
@@ -640,7 +641,7 @@ int main(void)
         printf("    Re-dedup:        verified (re-queued after COW)\n");
         printf("    NR_FILE_PAGES:   no underflow/overflow\n");
     } else {
-        printf("  [FAIL] Anchor stress test — %d CHECK(S) FAILED\n", fail_count);
+        printf("  [FAIL] Anchor comprehensive test — %d CHECK(S) FAILED\n", fail_count);
     }
     printf("============================================================\n");
 

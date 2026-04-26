@@ -26,9 +26,9 @@ echo "[*] Working dir: $TEST_WORKDIR"
 echo ""
 
 # --- 1. Compile -----------------------------------------------------------
-echo "[*] Compiling test_anchor_partial_match.c..."
-gcc -Wall -Wextra -O2 -o "$TEST_WORKDIR/test_anchor_partial_match" \
-    "$SCRIPT_DIR/test_anchor_partial_match.c" \
+echo "[*] Compiling test_16_anchor_partial_match.c..."
+gcc -Wall -Wextra -O2 -o "$TEST_WORKDIR/test_16_anchor_partial_match" \
+    "$SCRIPT_DIR/test_16_anchor_partial_match.c" \
     "$SCRIPT_DIR/common.c"
 echo "  -> OK"
 echo ""
@@ -51,7 +51,7 @@ echo ""
 echo "[*] Running test..."
 cd "$TEST_WORKDIR"
 RESULT=0
-sudo ./test_anchor_partial_match || RESULT=$?
+sudo ./test_16_anchor_partial_match || RESULT=$?
 cd "$SCRIPT_DIR"
 echo ""
 
@@ -148,7 +148,7 @@ fi
 echo ""
 
 # --- 8. Cleanup ------------------------------------------------------------
-rm -f "$TEST_WORKDIR/test_anchor_partial_match"
+rm -f "$TEST_WORKDIR/test_16_anchor_partial_match"
 rm -f "$TEST_WORKDIR/anchor_partial_a.dat" "$TEST_WORKDIR/anchor_partial_b.dat"
 
 # --- 9. Save full dmesg log ------------------------------------------------

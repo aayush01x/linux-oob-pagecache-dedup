@@ -1,5 +1,5 @@
 /*
- * test_cow_isolation_auto.c
+ * test_01_cow_isolation.c
  *
  * Fully automated COW isolation test (no getchar()).
  * Creates two identical files, waits for the OOB scanner to merge them,

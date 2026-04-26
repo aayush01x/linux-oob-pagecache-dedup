@@ -1,5 +1,5 @@
 /*
- * test_large_folio.c
+ * test_06_large_folio.c
  *
  * Force order > 0 folios via large sequential writes (XFS/ext4 with THP)
  * and verify dedup and COW work at non-order-0.

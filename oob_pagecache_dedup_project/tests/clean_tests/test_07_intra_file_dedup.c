@@ -1,7 +1,7 @@
 /*
- * test_intra_file_dedup.c
+ * test_07_intra_file_dedup.c
  *
- * INTRA-FILE DEDUPLICATION STRESS TEST
+ * INTRA-FILE DEDUPLICATION CORRECTNESS TEST
  *
  * This is the hardest scenario for the OOB dedup subsystem: a single file
  * whose pages contain duplicate content at DIFFERENT offsets within the
@@ -193,7 +193,7 @@ int main(void)
     printf("  -> File deleted without kernel panic\n");
 
     if (ret == 0)
-        printf("[PASS] Intra-file dedup stress test passed\n");
+        printf("[PASS] Intra-file deduplication test passed\n");
 
 out:
     free(blk);

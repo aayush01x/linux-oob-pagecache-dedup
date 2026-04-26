@@ -1,5 +1,5 @@
 /*
- * test_partial_truncate_dedup.c
+ * test_12_partial_truncate.c
  *
  * PARTIAL TRUNCATION OF DEDUPED FOLIOS — exercises truncate_inode_partial_folio
  *

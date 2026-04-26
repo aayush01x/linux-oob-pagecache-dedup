@@ -1,7 +1,7 @@
 /*
- * test_cascade_unlink.c
+ * test_08_cascade_unlink.c
  *
- * CASCADE UNLINK STRESS TEST — 5 files sharing the same folios
+ * CASCADE UNLINK CORRECTNESS TEST — 5 files sharing the same folios
  *
  * This exercises the rmap_count dissolve cascade: when N files share a
  * folio and you delete them one-by-one, each deletion must:
