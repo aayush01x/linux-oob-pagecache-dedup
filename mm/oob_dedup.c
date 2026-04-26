@@ -1095,6 +1095,10 @@ int oob_folio_break_dedup(struct address_space *mapping, struct folio **foliop,
 
     old_pfn = folio_pfn(old_folio);
     new_pfn = folio_pfn(new_folio);
+    /* Add page-cache refs for new_folio before inserting into XArray.
+     * filemap_free_folio (truncate/eviction) will drop folio_nr_pages
+     * refs, so we must match that here — same as filemap_add_folio. */
+    folio_ref_add(new_folio, folio_nr_pages(new_folio));
     xas_set_order(&xas, index, folio_order(new_folio));
     xas_store(&xas, new_folio);
     if (xas_error(&xas)) {
