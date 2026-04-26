@@ -2560,10 +2560,24 @@ static void filemap_get_read_batch(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
-	unsigned long _batch_retries = 0;
+	unsigned long _loop_iters = 0;
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
+		if (++_loop_iters > 100000) {
+			pr_err("OOB_DEDUP: [BATCH_LOOP] %lu iters! xa_index=%lu "
+				"index=%lu max=%lu batch_nr=%u "
+				"folio=%px folio_idx=%lu order=%u dedup=%d "
+				"inode=%lu\n",
+				_loop_iters, (unsigned long)xas.xa_index,
+				(unsigned long)index, (unsigned long)max,
+				folio_batch_count(fbatch),
+				folio, folio ? folio->index : 0,
+				folio ? folio_order(folio) : 0,
+				folio ? folio_test_dedup(folio) : 0,
+				mapping->host->i_ino);
+			break;
+		}
 		if (xas_retry(&xas, folio))
 			continue;
 		if (xas.xa_index > max || xa_is_value(folio))
@@ -2572,11 +2586,8 @@ static void filemap_get_read_batch(struct address_space *mapping,
 			break;
 		if (!folio_try_get(folio))
 			goto retry;
-    //pr_info("filemap_get_read_batch was called");
-		if (unlikely(folio != xas_reload(&xas))){
-      //pr_info("filemap_get_read_batch was called and issued an error");
+		if (unlikely(folio != xas_reload(&xas)))
 			goto put_folio;
-    }
 
 		if (!folio_batch_add(fbatch, folio))
 			break;
@@ -2589,16 +2600,6 @@ static void filemap_get_read_batch(struct address_space *mapping,
 put_folio:
 		folio_put(folio);
 retry:
-		if (++_batch_retries > 1000) {
-			pr_err("OOB_DEDUP: [BATCH_STUCK] xa_index=%lu "
-				"folio_idx=%lu order=%u dedup=%d refcnt=%d\n",
-				(unsigned long)xas.xa_index,
-				folio ? folio->index : 0,
-				folio ? folio_order(folio) : 0,
-				folio ? folio_test_dedup(folio) : 0,
-				folio ? folio_ref_count(folio) : -1);
-			break;
-		}
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
