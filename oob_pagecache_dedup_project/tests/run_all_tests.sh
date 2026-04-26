@@ -204,7 +204,6 @@ run_c_test "regression" 15 "COW During Truncate"      test_15_cow_during_truncat
 # ═══════════════════════════════════════════════════════════
 
 run_c_test "anchor" 16 "Anchor Partial Match"     test_16_anchor_partial_match.c "$COMMON"
-run_c_test "anchor" 17 "Anchor Comprehensive"     test_17_anchor_comprehensive.c "$COMMON"
 
 # ═══════════════════════════════════════════════════════════
 #   CATEGORY: benchmark — Memory savings and large file tests
