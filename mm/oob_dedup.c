@@ -195,7 +195,7 @@ static int deduplicate_folio(struct folio *orig_folio, struct folio *dup_folio,
     pgoff_t base_index = (index >> folio_order(dup_folio)) << folio_order(dup_folio);
 
     XA_STATE(xas, &mapping->i_pages, base_index);
-    xas_set_order(&xas, base_index, folio_order(orig_folio));
+    xas_set_order(&xas, base_index, folio_order(dup_folio));
     int err = -ENOMEM;
 
     // preallocate the entries and the info struct before taking

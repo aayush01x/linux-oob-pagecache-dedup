@@ -2560,6 +2560,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
+	unsigned long _batch_retries = 0;
 
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
@@ -2588,6 +2589,16 @@ static void filemap_get_read_batch(struct address_space *mapping,
 put_folio:
 		folio_put(folio);
 retry:
+		if (++_batch_retries > 1000) {
+			pr_err("OOB_DEDUP: [BATCH_STUCK] xa_index=%lu "
+				"folio_idx=%lu order=%u dedup=%d refcnt=%d\n",
+				(unsigned long)xas.xa_index,
+				folio ? folio->index : 0,
+				folio ? folio_order(folio) : 0,
+				folio ? folio_test_dedup(folio) : 0,
+				folio ? folio_ref_count(folio) : -1);
+			break;
+		}
 		xas_reset(&xas);
 	}
 	rcu_read_unlock();
