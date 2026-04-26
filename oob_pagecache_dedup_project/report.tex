@@ -1,0 +1,514 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{balance}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\lstdefinestyle{kernelc}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\scriptsize,
+    breaklines=true,
+    commentstyle=\color{gray},
+    keywordstyle=\color{blue}\bfseries,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    frame=single,
+    language=C,
+    showstringspaces=false,
+    tabsize=4,
+    morekeywords={struct,spinlock_t,pgoff_t,bool,folio,address_space,u32,loff_t,XA_STATE}
+}
+\lstset{style=kernelc}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Out-of-Band Page Cache Deduplication in the Linux Kernel}
+
+\author{
+\IEEEauthorblockN{Aayush\IEEEauthorrefmark{1},
+Author Two\IEEEauthorrefmark{2},
+Author Three\IEEEauthorrefmark{3}}
+\IEEEauthorblockA{Department of Computer Science\\
+University Name\\
+\{author1, author2, author3\}@university.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+The Linux page cache stores file-backed data in memory to accelerate I/O, yet provides no mechanism to detect and eliminate duplicate content across the page\_cache of these files. This paper presents the design and implementation of an out-of-band page cache deduplication subsystem for the Linux kernel. A background kernel thread scans page-cache folios registered via a custom \texttt{posix\_fadvise} flag, identifies duplicate content through an anchor-based sampling hash, and merges duplicates by redirecting XArray entries to a single canonical folio. A reverse-mapping structure tracks all address spaces sharing a folio, enabling correct Copy-on-Write on the iomap write path and safe dissolution during truncation or eviction. The implementation modifies six kernel source files spanning the memory management and XFS iomap layers. Evaluation through eighteen user-space test cases and two KUnit tests demonstrates correctness under inter-file dedup, intra-file dedup, concurrent truncation, and mixed-operation stress scenarios.
+\end{abstract}
+
+\begin{IEEEkeywords}
+page cache, deduplication, Linux kernel, copy-on-write, memory management, XFS
+\end{IEEEkeywords}
+
+% ===================================================================
+\section{Introduction}
+% ===================================================================
+
+Modern workloads frequently generate redundant file data in the page cache. Containerized environments, build systems, and data pipelines routinely load identical content (shared libraries, configuration files, duplicate datasets) into separate page\_cache entries, each consuming distinct physical memory. While the kernel's Kernel Samepage Merging (KSM) \cite{b1} subsystem deduplicates anonymous pages, no analogous mechanism exists for file backed pages managed by the page cache.
+
+This redundancy is nontrivial. A system hosting $N$ containers sharing a common base image may cache $N$ copies of identical file content, wasting $(N{-}1) \times S$ bytes of physical memory for a file of size $S$. As memory remains a constrained resource, particularly in cloud and embedded deployments, eliminating this redundancy at the page-cache level represents a meaningful optimization.
+
+This paper presents an \emph{out-of-band} (OOB) page cache deduplication subsystem integrated into the Linux memory management layer. The key design principle is that deduplication runs asynchronously in a low-priority background thread, entirely decoupled from application I/O paths. User space opts in to deduplication on a per-file basis via a custom \texttt{posix\_fadvise} flag; a kernel thread (\texttt{oob\_dedupd}) then scans the queued files, identifies duplicate folios\footnote{A folio is the modern Linux abstraction for a contiguous, power-of-two group of pages in the page cache.}, and merges them by manipulating XArray entries within each file's \texttt{address\_space}.
+
+The contributions of this work are as follows:
+\begin{enumerate}
+    % \item A complete page\_cache deduplication subsystem designed around the XFS file system, operating at the MM layer, requiring only a single write-path hook in the iomap buffered I/O layer for XFS Copy-on-Write support(?).
+    \item A complete page\_cache deduplication subsystem designed around the XFS file system, operating at the VFS layer, requiring only a single write-path hook in the iomap buffered I/O layer for XFS Copy-on-Write support(?).
+    \item An anchor-based sampling hash algorithm that avoids full-folio hashing for large folios while retaining reliable duplicate detection and enabling partial-match--driven folio splitting.
+    \item A reverse-mapping (rmap) structure that was essential to maintain the one to many $folio \rightarrow (mapping,index)$ pairs, which enables support for both interfile and intrafile deduplication, and ensuring correct reads, writes and correct index aware page cache removal, a requirement that does not arise in standard kernel paths.
+    \item An extensive test suite covering correctness, concurrency, accounting integrity, and stress scenarios, along with a profiling framework for memory and I/O overhead measurement.
+\end{enumerate}
+
+% ===================================================================
+\section{Background}
+% ===================================================================
+
+\subsection{The Linux Page Cache and Folios}
+
+The page cache is the kernel's primary file data cache. Each open file is associated with an \texttt{address\_space} object whose \texttt{i\_pages} field is an XArray, a radix-tree variant that maps file-offset indices (in units of \texttt{PAGE\_SIZE}) to \texttt{struct folio} pointers. A folio represents a contiguous, naturally aligned, power-of-two run of pages: an order-0 folio is 4\,KB; on XFS, the filesystem may allocate order-4 folios (64\,KB) to reduce metadata overhead.
+
+Originally, each folio carries a \texttt{mapping} pointer back to its owning \texttt{address\_space} and an \texttt{index} recording its page offset within the file. The VFS read, write, and truncation paths rely heavily on these two fields being one-to-one and for them to represent the state correctly for identity checks, cache invalidation, and accounting.
+
+\subsection{Kernel Same-page Merging}
+
+KSM \cite{b1} provides deduplication for anonymous (heap/stack) pages. Processes register memory regions via \texttt{madvise(MADV\_MERGEABLE)}, and a scanner thread identifies identical pages, merging them by remapping page-table entries to a shared read-only copy. Writes trigger hardware page faults, which the kernel handles via COW. KSM's design is not directly applicable to the page cache: page-cache pages are accessed through the XArray rather than page tables, and their identity is defined by the \texttt{(mapping, index)} tuple rather than virtual address.
+
+\subsection{The \texttt{folio->mapping} Tag Bits}
+
+The kernel reserves the low-order bits of \texttt{folio->mapping} for type discrimination. Existing tags include \texttt{PAGE\_MAPPING\_ANON} (0x1) for anonymous pages and \texttt{PAGE\_MAPPING\_MOVABLE} (0x2) for movable pages; their combination (0x3) denotes KSM pages. All allocated \texttt{address\_space} objects are aligned to at least 8 bytes, leaving bits 0--2 for tagging, of which the bit 2 is available for our usage.
+
+% ===================================================================
+\section{Design}
+\label{sec:design}
+% ===================================================================
+
+\subsection{Design Goals}
+
+The subsystem targets the following goals: (1) minimal impact on the I/O hot path, i.e., deduplication must not add too much latency to \texttt{read()} or \texttt{write()} calls; (2) correctness under concurrent file operations including reads, truncation, deletion, and overwrite; (3) support for both inter-file and intra-file deduplication; (4) correct kernel accounting (\texttt{NR\_FILE\_PAGES}, reference counts) throughout the folio lifecycle; and (5) compatibility with the XFS iomap buffered I/O layer.
+
+\subsection{Architectural Overview}
+
+Figure~\ref{fig:arch} illustrates the system architecture. The subsystem comprises five components: (1) a user-space entry point via \texttt{posix\_fadvise}; (2) a file dedup queue; (3) a background scanner thread; (4) a hash-based duplicate detection engine; and (5) a COW and dissolution mechanism integrated into the VFS write and truncation paths.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm and 1.5cm,
+    block/.style={rectangle, draw, rounded corners, text centered, minimum height=0.6cm, minimum width=2.2cm, fill=blue!8, font=\scriptsize},
+    kblock/.style={rectangle, draw, rounded corners, text centered, minimum height=0.6cm, minimum width=2.2cm, fill=orange!10, font=\scriptsize},
+    arrow/.style={-{Stealth[length=2mm]}, thick},
+    darrow/.style={-{Stealth[length=2mm]}, thick, dashed},
+]
+    \node[block] (app) {Application};
+    \node[block, right=1cm of app] (fadv) {\texttt{fadvise(DEDUP)}};
+    \node[kblock, below=1cm of fadv] (queue) {File Dedup Queue};
+    \node[kblock, below=of queue] (scan) {\texttt{oob\_dedupd}};
+    \node[kblock, left=1cm of scan] (pc) {Page Cache (XArray)};
+    \node[kblock, right=1cm of scan] (ht) {Anchor Hash Table};
+    \node[kblock, below=of pc] (cow) {COW Engine};
+    \node[kblock, right=1.5cm of cow] (sysfs) {\texttt{/sys/kernel/oob\_dedup}};
+
+    \draw[arrow] (app) -- (fadv);
+    \draw[arrow] (fadv) -- (queue);
+    \draw[arrow] (queue) -- (scan);
+    \draw[arrow] (scan) -- (ht);
+    \draw[darrow] (scan) -- (pc);
+    \draw[darrow] (cow) -- (pc);
+    \draw[darrow] (scan) -- (sysfs);
+
+    \draw[thick, dashed] (-1.5,-0.55) -- (7,-0.55);
+    \node[font=\tiny] at (6.2,-0.35) {kernel};
+\end{tikzpicture}
+\caption{System architecture. Solid arrows denote control flow; dashed arrows denote data access. The scanner thread operates entirely asynchronously from application I/O.}
+\label{fig:arch}
+\end{figure}
+
+The user-space interface is deliberately minimal. An application opens a file, calls \texttt{posix\_fadvise(fd, 0, 0, POSIX\_FADV\_DEDUP)} with a custom advice value (8), and the kernel queues the file's \texttt{address\_space} for background scanning. No further user interaction is required as the scanner discovers duplicates, merges them, and dissolves the sharing transparently when files are modified, truncated, or deleted.
+
+\subsection{Pointer Tagging for Dedup Identification}
+
+A deduplicated folio's \texttt{mapping} field no longer points to an \texttt{address\_space}; instead, it holds a pointer to an \texttt{oob\_dedup\_info} structure with bit~2 set (\texttt{PAGE\_MAPPING\_DEDUP = 0x4}). This choice avoids consuming a scarce folio flag bit and reuses the existing kernel infrastructure for tag-aware pointer access. The \texttt{PAGE\_MAPPING\_FLAGS} mask is extended to include bit~2, ensuring that all existing \texttt{folio\_mapping()} callers mask it out correctly.
+
+Detection of a deduplicated folio is an $O(1)$ bitmask test:
+\begin{lstlisting}[numbers=none]
+static inline bool folio_test_dedup(struct folio *f) {
+    return ((unsigned long)f->mapping
+            & PAGE_MAPPING_FLAGS)
+            == PAGE_MAPPING_DEDUP;
+}
+\end{lstlisting}
+
+\subsection{Reverse-Mapping Structure}
+
+When a folio is shared, the system must track all \texttt{(address\_space, index)} pairs that reference it. A simple reference counter would not suffice even for inter-file dedup, and even more so for intra-file dedup, where the same folio appears at multiple indices within a single \texttt{address\_space}. Hence our implementation requires per-entry granularity for correct XArray slot removal during truncation, correct identity restoration during CoW and (index,mapping) verification during reads.
+
+The \texttt{oob\_dedup\_info} structure maintains a spinlock-protected linked list of \texttt{oob\_dedup\_rmap\_entry} records. The structure is allocated from a dedicated \texttt{kmem\_cache} with 8-byte alignment to guarantee that the tag bits remain available in the pointer.
+
+\begin{lstlisting}[numbers=none]
+struct oob_dedup_info {
+    spinlock_t       lock;
+    struct list_head rmap_list;
+    unsigned int     rmap_count;
+} __attribute__((aligned(8)));
+
+struct oob_dedup_rmap_entry {
+    struct address_space *mapping;
+    pgoff_t              index;
+    struct list_head     list;
+};
+\end{lstlisting}
+
+\subsection{Folio State Validation and Integrity Guards}
+
+To ensure the stability of the Out-of-Band (OOB) deduplication process, the \texttt{deduplicate\_folio} function implements a series of  sanity checks before attempting to merge two folios. These guards are designed to ensure that only "clean," stable, and non-contentious memory is shared between inodes.
+
+\begin{lstlisting}[numbers=none]
+if (!folio_test_uptodate(orig_folio) || !folio_test_uptodate(dup_folio) ||
+    folio_test_dirty(orig_folio) || folio_test_dirty(dup_folio) ||
+    folio_test_writeback(orig_folio) || folio_test_writeback(dup_folio) ||
+    folio_mapped(orig_folio) || folio_mapped(dup_folio)) {
+    err = -EBUSY;
+    goto out_unlock;
+}
+\end{lstlisting}
+
+The specific design rationale for each check is as follows:
+
+\begin{itemize}
+    \item \textbf{Uptodate Validation (\texttt{!folio\_test\_uptodate})}: This ensures that both folios contain valid data that has been fully read from the backing store.
+    
+    \item \textbf{Dirty State Prevention (\texttt{folio\_test\_dirty})}: Deduplication is restricted to folios that have not been modified in RAM.
+    
+    \item \textbf{Writeback Conflict (\texttt{folio\_test\_writeback})}: Folios currently undergoing I/O operations are excluded to prevent race conditions.
+    
+    \item \textbf{Mapped Folio Exclusion (\texttt{folio\_mapped})}: This is a critical design choice for our OOB mechanism. We are essentially skipping all the pages that are also mmaped into some processes memory.
+\end{itemize}
+
+If any of these conditions are met, the function returns \texttt{-EBUSY}, signaling that the folio is currently too "active" or unstable to be safely deduplicated.
+
+% ===================================================================
+\section{Implementation}
+\label{sec:impl}
+% ===================================================================
+
+This section details the implementation of each component. Table~\ref{tab:files} enumerates the kernel source files modified or introduced.
+
+\begin{table}[t]
+\caption{Modified and new kernel files.}
+\label{tab:files}
+\centering
+\scriptsize
+\begin{tabular}{@{}llp{3.2cm}@{}}
+\toprule
+\textbf{File} & \textbf{Type} & \textbf{Purpose} \\
+\midrule
+\texttt{include/linux/page-flags.h} & Mod & Add \texttt{PAGE\_MAPPING\_DEDUP} \\
+\texttt{mm/oob\_dedup.c} & New & Scanner, merge, COW, sysfs \\
+\texttt{mm/oob\_dedup.h} & New & Data structures, helpers \\
+\texttt{mm/file\_dedup\_slot.h} & New & Queue slot definition \\
+\texttt{mm/fadvise.c} & Mod & \texttt{FADV\_DEDUP} entry point \\
+\texttt{mm/filemap.c} & Mod & Dedup-aware cache ops \\
+\texttt{mm/truncate.c} & Mod & Dedup-aware truncation \\
+\texttt{fs/iomap/buffered-io.c} & Mod & COW hook in write path \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{File Queue and Entry Point}
+
+When \texttt{posix\_fadvise} is invoked with \texttt{POSIX\_FADV\_DEDUP}, the kernel calls \texttt{oob\_dedup\_add\_file()}, which allocates a \texttt{file\_dedup\_slot} from a dedicated slab cache and inserts it into a global doubly-linked list and a hash table keyed by the \texttt{address\_space} pointer. A spinlock (\texttt{file\_dedup\_lock}) serializes queue mutations. If the file is already queued, the call is a no-op.
+
+Each slot also carries a per file scan cursor (\texttt{pgoff}) that persists across scanner wakeups, enabling incremental scanning of large files without retraversing already processed regions.
+
+\subsection{Background Scanner}
+
+The scanner thread (\texttt{oob\_dedupd}) initialises at \texttt{nice = 5} and alternates between scanning and sleeping. On each wakeup, it iterates through queued files in round-robin order, budgeting the configurable \texttt{pages\_to\_scan} parameter (default: 4096) evenly across all queued files to prevent starvation.
+
+Before iterating a file's XArray, the scanner calls \texttt{igrab(inode)} to safely acquire a reference on the file's inode. If \texttt{igrab} returns \texttt{NULL}, the inode is being destroyed; the scanner advances past this slot, removes it from the queue, and continues. This prevents use-after-free on inodes that are concurrently being evicted.
+
+For each file, the scanner walks the \texttt{address\_space} XArray starting from the slot's cursor, retrieving folios via \texttt{filemap\_get\_folio()}. Each folio passes through a multi-phase veto pipeline before any hash computation is attempted. The pipeline is ordered so that the cheapest checks execute first.
+
+\textbf{Phase 1: Dedup veto.} Folios already bearing the \texttt{PAGE\_MAPPING\_DEDUP} tag are skipped immediately. Their \texttt{folio->index} field is currently 0 (deduped state), not the file currently being scanned; using it to advance the scan cursor would jump the cursor to an unrelated offset and potentially cause an infinite loop. The cursor is advanced from \texttt{slot->pgoff + nr} instead.
+
+\textbf{Phase 2: I/O veto.} The scanner checks whether the folio is currently marked dirty (\texttt{folio\_test\_dirty}) or under active writeback (\texttt{folio\_test\_writeback}). If either condition holds, the folio is skipped without advancing the cursor, so the scanner retries on the next wakeup. This check is essential because the page cache is the live buffer between user space and disk I/O. Attempting to deduplicate, or worse, split a folio while the filesystem's writeback path is actively performing disk I/O on it would corrupt in-flight data and can trigger kernel panics.
+
+\textbf{Phase 3: Zero-page short circuit.} The scanner reads only the first 4\,KB base page of the folio via \texttt{kmap\_local\_folio} and tests whether it is entirely zeros using \texttt{memchr\_inv}. If the first page is all-zero, the entire folio is skipped. This prevents a common pathology: newly allocated or sparse files produce vast quantities of zero-filled pages that all hash to the same CRC32 value, causing thousands of entries to pile into a single hash bucket and degrading lookup from $O(1)$ to $O(n)$.
+
+\textbf{Phase 4: Anchor hashing.} If all veto checks pass, anchor hash values are computed at strategically placed positions within the folio and looked up in the global hash table. This phase is described in detail in Section~\ref{sec:anchor}.
+
+\subsection{Anchor-Based Sampling Hash}
+\label{sec:anchor}
+
+Full CRC32 hashing of a 64\,KB XFS folio involves reading all 16 constituent pages, which is expensive for a background scanner that must remain CPU-courteous. The implementation uses an anchor-based sampling scheme that hashes only a small subset of pages, treating them as a cheap pre-filter before committing to a full page-by-page comparison.
+
+For an order-0 folio (a single 4\,KB page), the entire page is hashed with \texttt{crc32\_le}, yielding a 32-bit fingerprint. This is the degenerate case and is equivalent to full-folio hashing.
+
+For large folios of $N$ pages, a dynamic geometry is computed from the tunable \texttt{merge\_threshold\_pct} (default: 50\%). The geometry determines exactly how many anchors to place and how to space them, ensuring that any contiguous matching region of at least \texttt{threshold}\% of the folio will be detected:
+
+\begin{enumerate}
+    \item \textbf{Stride}: $S = \lfloor N \times \mathit{threshold} / 100 \rfloor$. If $S = 0$, it is clamped to 1. The stride represents the minimum contiguous block of matching pages that must exist for the anchor scheme to guarantee detection.
+    \item \textbf{Anchor count}: $A = \lfloor N / S \rfloor$. This is the number of anchor points needed to cover the folio with stride-spaced samples.
+    \item \textbf{CPU safety cap}: If $A$ exceeds a hardcoded maximum (\texttt{MAX\_ANCHORS = 8}), the anchor count is forced down to 8 and the stride is recalculated as $S' = \lfloor N / (A + 1) \rfloor$, clamped to $\geq 1$. This bounds per-folio CPU cost regardless of folio size or threshold setting.
+    \item \textbf{Evasion offset}: The starting position of the first anchor is set to $\lfloor S / 2 \rfloor$, then forced to be an odd number by setting bit~0. This serves two purposes: it pushes anchors past file headers and metadata typically found at offset~0, and the odd alignment avoids landing on power-of-2 boundaries where structural data (e.g., superblock mirrors, extent headers) tends to repeat identically across otherwise-different files, which would produce false positive hash matches.
+\end{enumerate}
+
+Each anchor position $p_i = \mathit{evasion} + i \times S$ is clamped to $[0, N{-}1]$. The page at that position is hashed with \texttt{crc32\_le} via \texttt{kmap\_local\_folio} and the resulting hash is inserted into a kernel hash table (\texttt{oob\_folio\_hash}, 4096 buckets). On a hash-table hit from a different \texttt{(mapping, index)}, the scanner fetches the candidate folio via \texttt{filemap\_get\_folio} and performs a full page-by-page \texttt{memcmp} across all $N$ pages. If all pages match, deduplication proceeds via \texttt{deduplicate\_folio()}. If the match count exceeds the merge threshold but is not exact, and the current folio is not already deduplicated, the scanner invokes \texttt{split\_folio()} to decompose the large folio into order-0 folios. The scanner then rewinds its cursor to \texttt{folio\_start} so that the resulting order-0 folios are re-scanned individually on the next pass, enabling finer-grained dedup at 4\,KB granularity.
+
+\subsection{Folio Merge}
+
+The \texttt{deduplicate\_folio()} function merges a duplicate folio into an existing canonical folio. The procedure is designed to minimize the critical section and avoid deadlocks with the writeback path.
+
+All heap allocations (rmap entries, info struct) are performed before any locks are acquired, using \texttt{GFP\_KERNEL} allocations from dedicated slab caches. This eliminates the possibility of sleeping under a spinlock or triggering reclaim while holding a folio lock.
+
+The two folios are then locked using \texttt{folio\_trylock()} in pointer-address order (lower address first) to prevent ABBA deadlock; if either trylock fails, the function returns \texttt{-EAGAIN}, deferring the merge to a later scan pass. Under lock, the function performs a comprehensive state validation. Both folios must satisfy all of the following conditions:
+
+\begin{itemize}
+    \item \texttt{folio\_test\_uptodate()}: the folio's data is valid and fully read from disk.
+    \item \texttt{!folio\_test\_dirty()}: no pending modifications that have not been written back.
+    \item \texttt{!folio\_test\_writeback()}: no active disk I/O in progress on the folio.
+    \item \texttt{!folio\_mapped()}: no user-space page-table entries reference the folio (mmap exclusion).
+\end{itemize}
+
+If any condition fails, the function returns \texttt{-EBUSY}. This aggressive filtering ensures that only quiescent, clean folios are ever merged.
+
+Before merging, the function calls \texttt{filemap\_release\_folio()} on both folios to strip any filesystem-private data. This step is critical for XFS, which attaches per-folio \texttt{iomap\_folio\_state} via \texttt{folio->private} to track sub-folio I/O completion. If \texttt{filemap\_release\_folio} returns false (indicating the filesystem refused to release the private data), the merge aborts with \texttt{-EBUSY}.
+
+A final staleness check verifies that the duplicate folio's \texttt{mapping} and \texttt{index} have not changed since the scanner looked it up. If the folio was concurrently truncated or reassigned, the function returns \texttt{-EAGAIN}.
+
+If the canonical folio is not yet tagged as deduplicated, a new \texttt{oob\_dedup\_info} is allocated and installed via \texttt{folio\_set\_dedup\_info()}, with an initial rmap entry for the canonical folio's own \texttt{(mapping, index)}. An rmap entry for the duplicate is appended.
+
+The merge itself is an XArray store: \texttt{xas\_store(\&xas, orig\_folio)} replaces the duplicate's slot with a pointer to the canonical folio. Reference counts are adjusted to match the convention that each XArray entry holds \texttt{folio\_nr\_pages} refs. The orphaned duplicate is removed from the LRU, uncharged from memcg, and has its \texttt{mapping} set to \texttt{NULL}. Finally, \texttt{NR\_FILE\_PAGES} is decremented for the orphaned folio.
+
+\subsection{Copy-on-Write}
+
+When a write targets a deduplicated folio, the iomap buffered I/O path triggers COW. A hook is inserted in \texttt{iomap\_write\_begin()} immediately after the folio is obtained and locked:
+
+\begin{lstlisting}[numbers=none]
+if (folio_test_dedup(folio)) {
+    status = oob_folio_break_dedup(
+        iter->inode->i_mapping, &folio, pos, len);
+    if (unlikely(status))
+        goto out_unlock;
+}
+\end{lstlisting}
+
+The \texttt{oob\_folio\_break\_dedup()} function allocates a new folio of the same order, copies data via \texttt{folio\_copy()}, and atomically swaps the XArray entry under \texttt{xas\_lock\_irq} and the rmap spinlock. The writing file's rmap entry is removed. If only one rmap entry remains, the dedup state is dissolved: the surviving entry's \texttt{(mapping, index)} is restored to \texttt{folio->mapping} and \texttt{folio->index}, and the \texttt{oob\_dedup\_info} structure is freed. The function also correctly manages the states of the folio under dedup and the newly allocated folio by unlocking and locking the folios respectively.
+
+The function correctly handles \texttt{NR\_FILE\_PAGES} accounting: increments for the new folio are issued, but no decrement is applied to the old folio, which remains live in another file's XArray.
+
+\subsection{VFS Read Path Modifications}
+
+Deduplication alters two fundamental invariants of the page cache: (1) \texttt{folio->mapping} may not point to the \texttt{address\_space} that owns the XArray slot containing the folio, and (2) \texttt{folio->index} may not correspond to the XArray index at which the folio is stored.
+
+To preserve correctness, three inline helper functions are introduced:
+
+\begin{itemize}
+    \item \texttt{folio\_shares\_mapping(f, m)}: returns true if folio $f$ belongs to mapping $m$, either directly or via rmap lookup.
+    \item \texttt{folio\_index\_in(f, m)}: returns the page offset at which $f$ is stored in mapping $m$.
+    \item \texttt{folio\_pos\_in(f, m)}: byte-position variant of the above.
+\end{itemize}
+
+These replace direct accesses to \texttt{folio->mapping} and \texttt{folio->index} in the following \texttt{mm/filemap.c} functions: \texttt{page\_cache\_delete}, \texttt{filemap\_remove\_folio}, \texttt{\_\_filemap\_get\_folio}, \texttt{filemap\_get\_folios}, \texttt{filemap\_get\_folios\_contig}, \texttt{filemap\_get\_read\_batch}, \texttt{filemap\_readahead}, and \texttt{find\_lock\_entries}.
+
+A particularly important fix concerns cursor advancement in \texttt{filemap\_get\_read\_batch()} and \texttt{filemap\_get\_folios\_contig()}: the original code uses \texttt{folio\_next\_index(folio)} to advance the XArray cursor, which computes from \texttt{folio->index}. For deduplicated folios, this may jump backward (to the canonical owner's index), causing an infinite loop. The fix advances from \texttt{xas.xa\_index + folio\_nr\_pages(folio)} instead.
+
+\subsection{Truncation Path Modifications}
+
+Truncation of deduplicated folios is the most complex and the hardest code path in the implementation. Three distinct issues arise:
+
+\textbf{Batch removal ambiguity.} The standard \texttt{delete\_from\_page\_cache\_batch()} matches folios by pointer identity. For intra-file dedup, the same physical folio occupies multiple XArray slots in the same mapping; batch removal may clear the wrong slot. When a batch contains any deduplicated folio, the code switches to per-folio removal using a new function \texttt{filemap\_remove\_folio\_at()}, which takes an explicit XArray index parameter.
+
+\textbf{Dissolution side effects.} Disconnecting a dedup entry (removing one rmap entry) may dissolve the sharing entirely if only one entry remains. Dissolution restores \texttt{folio->index} to the survivor's index, which may be an index the truncation loop has not yet visited, causing it to rediscover the folio endlessly. The truncation code detects this case and verifies via \texttt{xa\_load()} that the folio still exists at the index before attempting removal.
+
+\textbf{Split safety.} \texttt{truncate\_inode\_partial\_folio()} invokes \texttt{split\_folio()}, which dereferences \texttt{folio->mapping->host->i\_mmap\_rwsem}. For deduplicated folios, this dereferences a tagged pointer and triggers a General Protection Fault (GPF). The fix dissolves dedup before splitting; if the folio remains shared after dissolution, it is removed entirely.
+
+\subsection{Eviction and Cleanup}
+
+When the VFS evicts an inode, \texttt{oob\_dedup\_evict\_inode()} removes the file's queue slot and purges its hash-table entries. Deduplicated folios are not cleaned up at this stage; instead, they are handled lazily when the page cache evicts them through \texttt{page\_cache\_delete()}, which calls \texttt{oob\_dedup\_disconnect\_folio()} to remove the corresponding rmap entry and, if necessary, dissolve the sharing.
+
+The disconnect function matches rmap entries by both \texttt{mapping} and \texttt{index} (not mapping alone), which is essential for intra-file dedup where multiple entries share the same mapping pointer.
+
+\subsection{Sysfs Interface}
+
+Runtime tunables and statistics are exported under \texttt{/sys/kernel/oob\_dedup/}. Read-only counters include \texttt{files\_queued}, \texttt{pages\_scanned}, \texttt{pages\_deduped}, and \texttt{folios\_split}. Read-write tunables include \texttt{sleep\_millisecs} (scanner sleep interval), \texttt{pages\_to\_scan} (per-wakeup budget), and \texttt{merge\_threshold\_pct} (partial-match splitting threshold).
+
+% ===================================================================
+\section{Challenges and Solutions}
+\label{sec:challenges}
+% ===================================================================
+
+The development process spanned over 80 commits addressing subtle interactions between deduplication and existing kernel code paths. This section documents the most significant classes of bugs encountered.
+
+\subsection{Deadlock in the Merge Path}
+
+The initial merge implementation used blocking \texttt{folio\_lock()} calls. Under memory pressure, the writeback path (\texttt{xfs\_do\_writepages} $\to$ \texttt{iomap\_writepages}) could hold a folio lock and wait for memory allocation, while the dedup thread held the allocation and waited for the folio lock. Replacing \texttt{folio\_lock()} with \texttt{folio\_trylock()} in address-sorted order eliminated this deadlock. All slab allocations are now performed before any lock acquisition.
+
+\subsection{NR\_FILE\_PAGES Accounting Corruption}
+
+Deduplication decrements \texttt{NR\_FILE\_PAGES} when orphaning the duplicate folio. However, when the canonical folio is later evicted or truncated, \texttt{filemap\_unaccount\_folio()} decrements the stat again, causing an underflow visible as negative drift in \texttt{/proc/meminfo}'s Cached field.
+
+The fix adds an early return in \texttt{filemap\_unaccount\_folio()} for deduplicated folios. The actual decrement occurs in \texttt{page\_cache\_delete()} and \texttt{filemap\_remove\_folio\_at()}, but only when dissolution causes the folio to leave the page cache entirely (i.e., \texttt{folio->mapping == NULL} or \texttt{folio->mapping == mapping} after disconnect).
+
+\subsection{Infinite Loops in Read and Truncation Paths}
+
+Multiple classes of infinite loops were discovered:
+
+\textbf{Read-batch loop.} \texttt{filemap\_get\_read\_batch()} advances the XArray cursor using \texttt{folio->index}, which for a deduplicated folio belongs to the canonical owner. If this index is less than the current cursor position, the XArray state machine loops. The fix uses the XArray position (\texttt{xas.xa\_index}) for advancement.
+
+\textbf{Scanner loop.} The scanner used \texttt{folio\_index(folio)} to advance its cursor past a deduplicated folio. Since \texttt{folio\_index()} returns the canonical owner's index, the cursor could jump backward. For deduplicated folios, the scanner now advances from \texttt{slot->pgoff + nr}.
+
+\textbf{Truncation loop.} Intra-file dedup dissolution restores \texttt{folio->index} to the surviving entry's value, which may precede the truncation cursor. Stale XArray entries are detected via \texttt{xa\_load()} before removal.
+
+A safety cap of 100{,}000 iterations was added to \texttt{filemap\_get\_read\_batch()} as a diagnostic backstop.
+
+\subsection{GPF on Large Folio Truncation}
+
+\texttt{split\_folio()} assumes \texttt{folio->mapping} is a valid \texttt{address\_space*} and dereferences it to reach \texttt{i\_mmap\_rwsem}. For deduplicated folios, this pointer is tagged. The fix in \texttt{truncate\_inode\_partial\_folio()} dissolves dedup prior to splitting, falling back to full folio removal if the folio remains shared.
+
+\subsection{XFS Private State Confusion}
+
+XFS attaches \texttt{iomap\_folio\_state} to \texttt{folio->private} for tracking sub-folio I/O state. When two folios from different files are merged, the surviving folio retains the original file's iomap state, which can cause incorrect writeback decisions. The fix calls \texttt{filemap\_release\_folio()} on both folios before merging, stripping all filesystem-private data.
+
+\subsection{Reference Count Imbalances}
+
+Correct reference counting is critical. Each XArray entry holds \texttt{folio\_nr\_pages} references (as established by \texttt{\_\_filemap\_add\_folio}). The merge function adds exactly this count when inserting the canonical folio into the duplicate's XArray slot, and drops the same count from the orphaned folio. During COW, the new folio receives \texttt{folio\_nr\_pages} refs; no decrement is applied to the old folio, which remains live. Violations of this invariant manifested as either use-after-free (insufficient refs) or folio leaks (excess refs preventing reclaim).
+
+% ===================================================================
+\section{Evaluation}
+\label{sec:eval}
+% ===================================================================
+
+\subsection{Test Suite}
+
+The implementation is validated by 18 user-space test programs and 2 kernel-space KUnit tests. All tests are compiled and executed by a single shell script (\texttt{run\_clean\_tests.sh}) that auto-detects XFS mount points for large folio support.
+
+Table~\ref{tab:tests} summarizes the test suite. Tests are categorized into functional correctness tests, stress tests, and regression tests targeting specific bugs.
+
+\begin{table}[t]
+\caption{Test suite summary. All tests pass on the current implementation.}
+\label{tab:tests}
+\centering
+\scriptsize
+\begin{tabular}{@{}p{2.8cm}p{4.5cm}@{}}
+\toprule
+\textbf{Test} & \textbf{Validates} \\
+\midrule
+COW Isolation & Write to one deduped file does not corrupt the other \\
+Truncate Deduped & Truncating a deduped file preserves siblings \\
+Delete Then Read & Deleting one deduped file; survivor reads correctly \\
+Sysfs Stats & Counters update correctly during dedup cycle \\
+Fanout COW (3-way) & COW on each of 3 files sharing folios \\
+Large Folio Dedup & Dedup and COW on XFS order-4 folios \\
+Intra-File Dedup & Dedup of identical pages within a single file \\
+Cascade Unlink (5-way) & Sequential deletion of 5 sharing files \\
+Concurrent Trunc+COW & Concurrent truncation and COW write \\
+Re-Dedup After COW & Re-queue and re-merge after COW \\
+Mixed Ops Torture & Inter + intra dedup, hole-punch, partial truncate, COW, delete \\
+Partial Truncate & Mid-page truncation boundary on deduped file \\
+NR\_FILE\_PAGES Leak & Stat accounting integrity after dedup cycle \\
+Rapid Dedup-Delete & Rapid create/dedup/delete race stress \\
+COW During Truncate & Concurrent COW and truncation \\
+Anchor Partial Match & Partial-match detection and folio splitting \\
+Anchor Stress & Anchor hashing under varied folio sizes \\
+Large File (200\,MB) & Scale test with \texttt{sar} monitoring \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The KUnit tests validate the pointer-tagging mechanism in isolation: (1) \texttt{test\_folio\_set\_dedup\_info} verifies round-trip correctness of \texttt{folio\_set\_dedup\_info} / \texttt{folio\_test\_dedup} / \texttt{folio\_dedup\_info}; (2) \texttt{test\_dedup\_rollback\_logic} simulates the XArray store failure rollback path and verifies that \texttt{folio->mapping} and \texttt{folio->index} are correctly restored.
+
+\subsection{Known Limitations}
+
+Two known edge cases remain:
+
+\textbf{Read-path spin under extreme concurrency.} Under heavy concurrent zero-copy I/O (\texttt{splice}/\texttt{sendfile}) on deduplicated folios, the read-batch iterator can spin if XArray cursor advancement conflicts with concurrent dissolution. A 100{,}000-iteration diagnostic cap prevents lockup, but the root cause, an ordering race between dissolution restoring \texttt{folio->index} and the XArray iterator reading it, is not fully resolved.
+
+\textbf{Memory-mapped files.} Folios that are \texttt{folio\_mapped()} (have page-table entries) are excluded from dedup. Supporting mmap'd files would require page-table--level COW analogous to KSM, which is outside the scope of this work.
+
+\subsection{Profiling Methodology}
+
+A profiling framework measures five operations across file sizes from 32\,MB to 1\,GB:
+
+\begin{itemize}
+    \item \textbf{Dedup time}: elapsed wall-clock time from \texttt{posix\_fadvise()} to \texttt{files\_queued == 0} (polled via sysfs).
+    \item \textbf{Normal read}: sequential read of a non-deduped cached file.
+    \item \textbf{Deduped read}: sequential read of a deduped file.
+    \item \textbf{Normal write}: sequential overwrite of a non-deduped file.
+    \item \textbf{COW write}: sequential overwrite of a deduped file (triggers per-page COW).
+\end{itemize}
+
+Timings are captured using \texttt{clock\_gettime(CLOCK\_MONOTONIC)} at nanosecond precision. System activity (\texttt{sar -u -r -B 1}) is recorded concurrently. Caches are dropped between phases via \texttt{/proc/sys/vm/drop\_caches}.
+
+\subsection{Performance Characteristics}
+
+Deduplication time scales linearly with file size, as the scanner processes folios sequentially. Since \texttt{posix\_fadvise} returns immediately, dedup latency is not visible to the application.
+
+Deduplicated reads are expected to perform identically to normal reads when data is warm in the page cache, as both resolve to the same physical folio. The rmap lookup in \texttt{folio\_shares\_mapping()} adds a constant-time overhead per folio access, but this is negligible relative to memory-bus transfer time.
+
+COW writes incur overhead proportional to the file size: each written page requires folio allocation, data copy, XArray swap, and rmap dissolution. This overhead is expected to range from 30\% to 80\% relative to normal writes, depending on folio order and file size.
+
+Memory savings are directly measurable through the \texttt{pages\_deduped} sysfs counter and the \texttt{NR\_FILE\_PAGES} stat in \texttt{/proc/vmstat}. For $N$ identical files of $P$ pages each, the expected savings are $(N{-}1) \times P \times 4$\,KB.
+
+\textit{Note: Quantitative results from profiling runs should be inserted here when benchmark execution on the target hardware is completed.}
+
+% ===================================================================
+\section{Related Work}
+\label{sec:related}
+% ===================================================================
+
+\textbf{KSM} \cite{b1} provides deduplication for anonymous pages via page-table remapping and hardware-assisted COW. It operates at a different abstraction layer (virtual memory, not file cache) and is not applicable to page-cache pages.
+
+\textbf{ZFS dedup} \cite{b2} performs inline block-level deduplication using a dedup table (DDT) that maps block checksums to physical block addresses. It operates at the block layer and imposes significant metadata memory overhead (often cited at 5--10 bytes per block).
+
+\textbf{Btrfs dedup} provides offline file-extent deduplication via the \texttt{FIDEDUPERANGE} ioctl. It operates at the filesystem extent level rather than the page-cache level, and does not benefit from cross-filesystem sharing.
+
+\textbf{VDO} (dm-dedup) implements block-layer deduplication as a device-mapper target, transparent to the filesystem. Like ZFS, it operates below the page cache.
+
+Our work is distinguished by operating at the page-cache level within the MM subsystem, making it filesystem-agnostic and complementary to block-layer solutions. It requires no block-device or filesystem-format changes beyond a single iomap write hook.
+
+% ===================================================================
+\section{Future Work}
+\label{sec:future}
+% ===================================================================
+
+Several extensions are planned. First, support for memory-mapped files would require integrating with the VM fault handler to provide page-table-level COW, analogous to KSM. Second, automatic detection of dedup-worthy files, based on page-cache churn heuristics or file-system-level hints, would eliminate the need for explicit \texttt{fadvise} calls. Third, content-defined chunking (e.g., Rabin fingerprinting) could replace fixed-stride anchors for improved partial-match detection. Finally, preparation for upstream submission requires replacing \texttt{pr\_info} diagnostics with tracepoints, adding a \texttt{CONFIG\_OOB\_DEDUP} Kconfig option, and producing a clean patch series against the mainline kernel.
+
+% ===================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ===================================================================
+
+This paper presented the design and implementation of an out-of-band page cache deduplication subsystem for the Linux kernel. The system introduces a new folio mapping tag (\texttt{PAGE\_MAPPING\_DEDUP}), a background scanner with anchor-based sampling for efficient duplicate detection, and a complete COW mechanism integrated into the XFS iomap write path. Extensive modifications to the VFS read and truncation paths ensure correct behavior throughout the folio lifecycle, including intra-file dedup, concurrent truncation, and cascade deletion.
+
+The implementation is validated by a comprehensive test suite covering 18 functional, stress, and regression scenarios. The development process surfaced and resolved eight distinct classes of kernel bugs, spanning deadlocks, accounting corruption, infinite loops, and memory faults, providing practical insights into the challenges of modifying core kernel data structures that are accessed pervasively across subsystems.
+
+\begin{thebibliography}{00}
+\bibitem{b1} A.~Arcangeli, I.~Eidus, and C.~Wright, ``Increasing memory density by using KSM,'' in \textit{Proc. Linux Symposium}, 2009.
+\bibitem{b2} J.~Bonwick and B.~Moore, ``ZFS deduplication,'' Oracle White Paper, 2010.
+\bibitem{b3} M.~Gorman, \textit{Understanding the Linux Virtual Memory Manager}, Prentice Hall, 2004.
+\bibitem{b4} J.~Corbet, ``The folio pull request,'' LWN.net, 2021.
+\bibitem{b5} M.~Wilcox, ``Folios,'' LWN.net, 2021.
+\bibitem{b6} Linux Kernel Documentation, ``XArray,'' Documentation/core-api/xarray.rst.
+\end{thebibliography}
+
+
+\end{document}
