@@ -15,6 +15,7 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
+#include <linux/ktime.h>
 #include "oob_dedup.h"
 #include <linux/memcontrol.h>
 #include "internal.h"
@@ -43,6 +44,15 @@ static atomic_t stat_files_queued = ATOMIC_INIT(0);
 static atomic_t stat_pages_deduped = ATOMIC_INIT(0);
 static atomic_t stat_pages_scanned = ATOMIC_INIT(0);
 static atomic_t stat_folios_split = ATOMIC_INIT(0);
+
+/* Fine-grained per-phase timing accumulators (nanoseconds).
+ * Measured inside the scanner thread; safe to use atomic64 add.
+ * Reset via /sys/kernel/oob_dedup/reset_stats.
+ */
+static atomic64_t stat_time_hash_ns    = ATOMIC64_INIT(0);
+static atomic64_t stat_time_compare_ns = ATOMIC64_INIT(0);
+static atomic64_t stat_time_merge_ns   = ATOMIC64_INIT(0);
+static atomic64_t stat_time_active_ns  = ATOMIC64_INIT(0);
 
 static unsigned int merge_threshold_pct = 50;
 
@@ -393,7 +403,12 @@ static void check_and_store_folio(struct folio *folio,
 	if (nr <= 1) {
 		/* Order-0 folio: single page, degenerate to full-page hash */
 		n_anchors = 1;
-		anchor_hashes[0] = hash_page_at(folio, 0);
+		{
+			ktime_t _th = ktime_get();
+			anchor_hashes[0] = hash_page_at(folio, 0);
+			atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), _th)),
+				     &stat_time_hash_ns);
+		}
 		anchor_positions[0] = 0;
 
 	} else {
@@ -405,7 +420,12 @@ static void check_and_store_folio(struct folio *folio,
 			if (pos >= nr)
 				pos = nr - 1; /* clamp to last page */
 			anchor_positions[i] = pos;
-			anchor_hashes[i] = hash_page_at(folio, pos);
+			{
+				ktime_t _th = ktime_get();
+				anchor_hashes[i] = hash_page_at(folio, pos);
+				atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), _th)),
+					     &stat_time_hash_ns);
+			}
 		}
 	}
 
@@ -446,9 +466,16 @@ static void check_and_store_folio(struct folio *folio,
 
 				if (folio_order(orig_folio) ==
 				    folio_order(folio)) {
-					unsigned int matched =
-						compare_folios_count(orig_folio,
-								     folio);
+					unsigned int matched;
+					{
+						ktime_t _tc = ktime_get();
+						matched = compare_folios_count(
+							orig_folio, folio);
+						atomic64_add(
+							ktime_to_ns(ktime_sub(
+								ktime_get(), _tc)),
+							&stat_time_compare_ns);
+					}
 
 					if (matched == nr) {
 						pr_info("Exact duplicate verified! (anchor %u hit)\n",
@@ -460,9 +487,16 @@ static void check_and_store_folio(struct folio *folio,
 							mapping->host->i_ino,
 							index,
 							folio_order(folio));
-						err = deduplicate_folio(
-							orig_folio, folio,
-							mapping, index);
+						{
+							ktime_t _tm = ktime_get();
+							err = deduplicate_folio(
+								orig_folio, folio,
+								mapping, index);
+							atomic64_add(
+								ktime_to_ns(ktime_sub(
+									ktime_get(), _tm)),
+								&stat_time_merge_ns);
+						}
 						if (err == 0) {
 							pr_info("Folio deduped successfully\n");
 							found = true;
@@ -542,6 +576,7 @@ static void check_and_store_folio(struct folio *folio,
 
 static void oob_dedup_do_scan(void)
 {
+	ktime_t _scan_start = ktime_get();
 	struct file_dedup_slot *slot;
 	struct address_space *slot_mapping;
 	struct folio *folio;
@@ -732,6 +767,8 @@ static void oob_dedup_do_scan(void)
 			spin_unlock(&file_dedup_lock);
 		}
 	}
+	atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), _scan_start)),
+		     &stat_time_active_ns);
 }
 static int oob_dedup_thread_fn(void *nothing)
 {
@@ -854,6 +891,65 @@ static ssize_t folios_split_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%d\n", atomic_read(&stat_folios_split));
 }
 
+/* ---- per-phase timing sysfs attributes ---- */
+
+static ssize_t time_hash_ns_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&stat_time_hash_ns));
+}
+
+static ssize_t time_compare_ns_show(struct kobject *kobj,
+				     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&stat_time_compare_ns));
+}
+
+static ssize_t time_merge_ns_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&stat_time_merge_ns));
+}
+
+static ssize_t time_active_ns_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&stat_time_active_ns));
+}
+
+/*
+ * reset_stats: write '1' to atomically zero all counters and timers.
+ * Useful for isolating a single profiling run.
+ */
+static ssize_t reset_stats_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	unsigned int val;
+
+	if (kstrtouint(buf, 10, &val) == 0 && val == 1) {
+		atomic_set(&stat_pages_deduped, 0);
+		atomic_set(&stat_pages_scanned, 0);
+		atomic_set(&stat_folios_split,  0);
+		atomic64_set(&stat_time_hash_ns,    0);
+		atomic64_set(&stat_time_compare_ns, 0);
+		atomic64_set(&stat_time_merge_ns,   0);
+		atomic64_set(&stat_time_active_ns,  0);
+		pr_debug("OOB_DEDUP: stats reset by userspace\n");
+	}
+	return count;
+}
+
+static ssize_t reset_stats_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0\n"); /* write-only in practice */
+}
+
 static ssize_t sleep_millisecs_show(struct kobject *kobj,
 				    struct kobj_attribute *attr, char *buf)
 {
@@ -911,20 +1007,31 @@ static ssize_t pages_to_scan_store(struct kobject *kobj,
 	return count;
 }
 
-static struct kobj_attribute files_queued_attr = __ATTR_RO(files_queued);
-static struct kobj_attribute pages_deduped_attr = __ATTR_RO(pages_deduped);
-static struct kobj_attribute pages_scanned_attr = __ATTR_RO(pages_scanned);
-static struct kobj_attribute folios_split_attr = __ATTR_RO(folios_split);
-static struct kobj_attribute sleep_millisecs_attr = __ATTR_RW(sleep_millisecs);
-static struct kobj_attribute merge_threshold_pct_attr =
-	__ATTR_RW(merge_threshold_pct);
-static struct kobj_attribute pages_to_scan_attr = __ATTR_RW(pages_to_scan);
+static struct kobj_attribute files_queued_attr        = __ATTR_RO(files_queued);
+static struct kobj_attribute pages_deduped_attr       = __ATTR_RO(pages_deduped);
+static struct kobj_attribute pages_scanned_attr       = __ATTR_RO(pages_scanned);
+static struct kobj_attribute folios_split_attr        = __ATTR_RO(folios_split);
+static struct kobj_attribute sleep_millisecs_attr     = __ATTR_RW(sleep_millisecs);
+static struct kobj_attribute merge_threshold_pct_attr = __ATTR_RW(merge_threshold_pct);
+static struct kobj_attribute pages_to_scan_attr       = __ATTR_RW(pages_to_scan);
+
+/* timing attrs */
+static struct kobj_attribute time_hash_ns_attr    = __ATTR_RO(time_hash_ns);
+static struct kobj_attribute time_compare_ns_attr = __ATTR_RO(time_compare_ns);
+static struct kobj_attribute time_merge_ns_attr   = __ATTR_RO(time_merge_ns);
+static struct kobj_attribute time_active_ns_attr  = __ATTR_RO(time_active_ns);
+static struct kobj_attribute reset_stats_attr     = __ATTR_RW(reset_stats);
 
 static struct attribute *oob_dedup_attrs[] = {
-	&files_queued_attr.attr,    &pages_deduped_attr.attr,
-	&pages_scanned_attr.attr,   &folios_split_attr.attr,
-	&sleep_millisecs_attr.attr, &merge_threshold_pct_attr.attr,
-	&pages_to_scan_attr.attr,   NULL,
+	&files_queued_attr.attr,        &pages_deduped_attr.attr,
+	&pages_scanned_attr.attr,       &folios_split_attr.attr,
+	&sleep_millisecs_attr.attr,     &merge_threshold_pct_attr.attr,
+	&pages_to_scan_attr.attr,
+	/* timing */
+	&time_hash_ns_attr.attr,        &time_compare_ns_attr.attr,
+	&time_merge_ns_attr.attr,       &time_active_ns_attr.attr,
+	&reset_stats_attr.attr,
+	NULL,
 };
 ATTRIBUTE_GROUPS(oob_dedup);
 

@@ -60,6 +60,17 @@ static long read_sysfs_long(const char *name)
     return strtol(buf, NULL, 10);
 }
 
+static int write_sysfs(const char *name, const char *val)
+{
+    char path[256];
+    snprintf(path, sizeof(path), SYSFS_ROOT "%s", name);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t w = write(fd, val, strlen(val));
+    close(fd);
+    return (w < 0) ? -1 : 0;
+}
+
 /* ─── /proc/meminfo parser ────────────────────────────────── */
 
 static long parse_meminfo_kb(const char *key)
@@ -307,6 +318,96 @@ static void do_dedup_wait(int timeout_s)
     printf("files_queued_final: %ld\n", read_sysfs_long("files_queued"));
 }
 
+/* ─── Mode: reset-stats ───────────────────────────────────── */
+
+static void do_reset_stats(void)
+{
+    if (write_sysfs("reset_stats", "1") < 0) {
+        fprintf(stderr, "Cannot write to " SYSFS_ROOT "reset_stats\n"
+                        "Is the OOB dedup module loaded?\n");
+        exit(1);
+    }
+    printf("reset_stats: ok\n");
+}
+
+/* ─── Mode: eviction-profile ─────────────────────────────── */
+/*
+ * This mode:
+ *   1. Resets all sysfs counters and timers.
+ *   2. Warms all files into page cache.
+ *   3. Issues POSIX_FADV_DEDUP on each file.
+ *   4. Polls files_queued until 0 (scanner finished).
+ *   5. Reads back all four per-phase timing values from sysfs.
+ *
+ * Output is key: value lines, identical format to --dedup so
+ * run_eviction_profile.py can parse it uniformly.
+ */
+static void do_eviction_profile(int nfiles, char **paths)
+{
+    /* 1. Reset all stats so this run is isolated */
+    if (write_sysfs("reset_stats", "1") < 0) {
+        fprintf(stderr, "Cannot reset sysfs stats — module loaded?\n");
+        exit(1);
+    }
+
+    /* 2. Open + warm every file into page cache */
+    int *fds = malloc(sizeof(int) * (size_t)nfiles);
+    if (!fds) { perror("malloc"); exit(1); }
+
+    for (int i = 0; i < nfiles; i++) {
+        fds[i] = open(paths[i], O_RDONLY);
+        if (fds[i] < 0) { perror("eviction open"); exit(1); }
+        char tmp[65536];
+        ssize_t n;
+        while ((n = read(fds[i], tmp, sizeof(tmp))) > 0) {}
+        lseek(fds[i], 0, SEEK_SET);
+    }
+
+    /* 3. Timestamp + issue fadvise(DEDUP) on all files */
+    uint64_t t0 = now_ns();
+    for (int i = 0; i < nfiles; i++)
+        posix_fadvise(fds[i], 0, 0, POSIX_FADV_DEDUP);
+
+    /* 4. Poll files_queued until scanner drains the queue */
+    int polls = 0;
+    while (1) {
+        long q = read_sysfs_long("files_queued");
+        if (q == 0) break;
+        if (q < 0) {
+            fprintf(stderr, "Cannot read files_queued\n");
+            exit(1);
+        }
+        usleep(500);
+        if (++polls > 1200000) { /* 10 min hard timeout */
+            fprintf(stderr, "eviction-profile: timeout!\n");
+            break;
+        }
+    }
+    uint64_t wall_ns = now_ns() - t0;
+
+    for (int i = 0; i < nfiles; i++)
+        close(fds[i]);
+    free(fds);
+
+    /* 5. Read per-phase timers from sysfs */
+    long hash_ns    = read_sysfs_long("time_hash_ns");
+    long compare_ns = read_sysfs_long("time_compare_ns");
+    long merge_ns   = read_sysfs_long("time_merge_ns");
+    long active_ns  = read_sysfs_long("time_active_ns");
+    long deduped    = read_sysfs_long("pages_deduped");
+    long scanned    = read_sysfs_long("pages_scanned");
+
+    printf("eviction_wall_ns: %llu\n",    (unsigned long long)wall_ns);
+    printf("eviction_active_ns: %ld\n",   active_ns);
+    printf("eviction_hash_ns: %ld\n",     hash_ns);
+    printf("eviction_compare_ns: %ld\n",  compare_ns);
+    printf("eviction_merge_ns: %ld\n",    merge_ns);
+    printf("eviction_pages_deduped: %ld\n", deduped);
+    printf("eviction_pages_scanned: %ld\n", scanned);
+    printf("eviction_polls: %d\n",         polls);
+    printf("eviction_files: %d\n",         nfiles);
+}
+
 /* ─── Mode: concurrent-rw ─────────────────────────────────── */
 
 struct crw_args {
@@ -411,6 +512,10 @@ int main(int argc, char **argv)
         do_meminfo();
     else if (strcmp(argv[1], "--sysfs") == 0)
         do_sysfs_snapshot();
+    else if (strcmp(argv[1], "--reset-stats") == 0)
+        do_reset_stats();
+    else if (strcmp(argv[1], "--eviction-profile") == 0 && argc >= 3)
+        do_eviction_profile(argc - 2, argv + 2);
     else if (strcmp(argv[1], "--create") == 0 && argc == 5)
         do_create(argv[2], atoi(argv[3]), argv[4][0]);
     else if (strcmp(argv[1], "--copy") == 0 && argc == 4)
@@ -432,12 +537,15 @@ usage:
         "  %s --cow-write <file>\n"
         "  %s --dedup <file1> [file2 ...]\n"
         "  %s --dedup-wait <timeout_s>\n"
+        "  %s --eviction-profile <file1> [file2 ...]\n"
+        "  %s --reset-stats\n"
         "  %s --meminfo\n"
         "  %s --sysfs\n"
         "  %s --create <file> <size_mb> <fill_char>\n"
         "  %s --copy <src> <dst>\n"
         "  %s --concurrent-rw <file> <threads> [iters_per_thread]\n",
         argv[0], argv[0], argv[0], argv[0], argv[0],
-        argv[0], argv[0], argv[0], argv[0], argv[0]);
+        argv[0], argv[0], argv[0], argv[0], argv[0],
+        argv[0], argv[0]);
     return 1;
 }
