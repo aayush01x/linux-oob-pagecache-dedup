@@ -1,0 +1,34 @@
+\begin{table}[h]
+  \centering
+  \caption{Profiling Data Breakdown (Time in ms)}
+  \label{tab:eviction-profile}
+  \begin{tabular}{|r|r|r|r|r|}
+    \hline
+    \textbf{Size (MB)} & \textbf{Total Active (ms)} & \textbf{Hash (ms)} & \textbf{Compare (ms)} & \textbf{Merge (ms)} \\
+    \hline
+    1 & 7.862 & 2.097 & 0.616 & 3.258 \\
+    \hline
+    2 & 25.179 & 2.681 & 1.156 & 18.695 \\
+    \hline
+    4 & 12.877 & 2.899 & 2.292 & 4.918 \\
+    \hline
+    8 & 13.442 & 2.982 & 5.813 & 0.840 \\
+    \hline
+    16 & 24.888 & 4.008 & 13.482 & 1.705 \\
+    \hline
+    32 & 43.162 & 4.157 & 30.572 & 2.157 \\
+    \hline
+    64 & 55.013 & 5.518 & 42.292 & 1.418 \\
+    \hline
+    128 & 95.277 & 4.992 & 79.085 & 3.833 \\
+    \hline
+    256 & 209.078 & 10.976 & 177.030 & 4.814 \\
+    \hline
+    512 & 424.105 & 19.741 & 364.301 & 8.382 \\
+    \hline
+    1024 & 845.180 & 37.708 & 731.600 & 16.558 \\
+    \hline
+    1536 & 1394.111 & 116.491 & 1062.410 & 56.454 \\
+    \hline
+  \end{tabular}
+\end{table}

@@ -1,0 +1,114 @@
+{
+  "sizes": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    1536
+  ],
+  "results": {
+    "1": {
+      "active_ns": 7862245.0,
+      "hash_ns": 2096641.0,
+      "compare_ns": 616089.0,
+      "merge_ns": 3258384.0,
+      "pages_deduped": 127.0,
+      "pages_scanned": 512.0
+    },
+    "2": {
+      "active_ns": 25179406.0,
+      "hash_ns": 2681268.0,
+      "compare_ns": 1156205.0,
+      "merge_ns": 18695101.0,
+      "pages_deduped": 158.0,
+      "pages_scanned": 1024.0
+    },
+    "4": {
+      "active_ns": 12876935.0,
+      "hash_ns": 2898742.0,
+      "compare_ns": 2292380.0,
+      "merge_ns": 4918483.0,
+      "pages_deduped": 166.0,
+      "pages_scanned": 2048.0
+    },
+    "8": {
+      "active_ns": 13441893.0,
+      "hash_ns": 2981545.0,
+      "compare_ns": 5813056.0,
+      "merge_ns": 839547.0,
+      "pages_deduped": 174.0,
+      "pages_scanned": 4096.0
+    },
+    "16": {
+      "active_ns": 24887882.0,
+      "hash_ns": 4007611.0,
+      "compare_ns": 13481587.0,
+      "merge_ns": 1705489.0,
+      "pages_deduped": 190.0,
+      "pages_scanned": 8192.0
+    },
+    "32": {
+      "active_ns": 43161745.0,
+      "hash_ns": 4156714.0,
+      "compare_ns": 30572391.0,
+      "merge_ns": 2157443.0,
+      "pages_deduped": 222.0,
+      "pages_scanned": 16384.0
+    },
+    "64": {
+      "active_ns": 55013443.0,
+      "hash_ns": 5518136.0,
+      "compare_ns": 42292399.0,
+      "merge_ns": 1417605.0,
+      "pages_deduped": 286.0,
+      "pages_scanned": 32768.0
+    },
+    "128": {
+      "active_ns": 95276952.0,
+      "hash_ns": 4992035.0,
+      "compare_ns": 79084851.0,
+      "merge_ns": 3833425.0,
+      "pages_deduped": 414.0,
+      "pages_scanned": 65536.0
+    },
+    "256": {
+      "active_ns": 209078470.0,
+      "hash_ns": 10975651.0,
+      "compare_ns": 177029796.0,
+      "merge_ns": 4814083.0,
+      "pages_deduped": 670.0,
+      "pages_scanned": 131072.0
+    },
+    "512": {
+      "active_ns": 424105050.0,
+      "hash_ns": 19740508.0,
+      "compare_ns": 364300684.0,
+      "merge_ns": 8382191.0,
+      "pages_deduped": 1182.0,
+      "pages_scanned": 262144.0
+    },
+    "1024": {
+      "active_ns": 845180223.0,
+      "hash_ns": 37708470.0,
+      "compare_ns": 731599978.0,
+      "merge_ns": 16558017.0,
+      "pages_deduped": 2206.0,
+      "pages_scanned": 524288.0
+    },
+    "1536": {
+      "active_ns": 1394111326.0,
+      "hash_ns": 116491073.0,
+      "compare_ns": 1062410005.0,
+      "merge_ns": 56453914.0,
+      "pages_deduped": 7314.0,
+      "pages_scanned": 786432.0
+    }
+  }
+}
