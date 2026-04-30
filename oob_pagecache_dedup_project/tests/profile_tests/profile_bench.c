@@ -397,15 +397,21 @@ static void do_eviction_profile(int nfiles, char **paths)
     long deduped    = read_sysfs_long("pages_deduped");
     long scanned    = read_sysfs_long("pages_scanned");
 
-    printf("eviction_wall_ns: %llu\n",    (unsigned long long)wall_ns);
-    printf("eviction_active_ns: %ld\n",   active_ns);
-    printf("eviction_hash_ns: %ld\n",     hash_ns);
-    printf("eviction_compare_ns: %ld\n",  compare_ns);
-    printf("eviction_merge_ns: %ld\n",    merge_ns);
-    printf("eviction_pages_deduped: %ld\n", deduped);
-    printf("eviction_pages_scanned: %ld\n", scanned);
-    printf("eviction_polls: %d\n",         polls);
-    printf("eviction_files: %d\n",         nfiles);
+    /* Convert pages → MB  (1 page = 4096 bytes = 4 KiB) */
+    double mb_freed   = (double)deduped * 4096.0 / (1024.0 * 1024.0);
+    double mb_scanned = (double)scanned * 4096.0 / (1024.0 * 1024.0);
+
+    printf("eviction_wall_ns: %llu\n",      (unsigned long long)wall_ns);
+    printf("eviction_active_ns: %ld\n",     active_ns);
+    printf("eviction_hash_ns: %ld\n",       hash_ns);
+    printf("eviction_compare_ns: %ld\n",    compare_ns);
+    printf("eviction_merge_ns: %ld\n",      merge_ns);
+    printf("eviction_mb_freed: %.3f\n",     mb_freed);
+    printf("eviction_mb_scanned: %.3f\n",   mb_scanned);
+    printf("eviction_pages_deduped: %ld\n", deduped);   /* raw, for cross-check */
+    printf("eviction_pages_scanned: %ld\n", scanned);   /* raw, for cross-check */
+    printf("eviction_polls: %d\n",           polls);
+    printf("eviction_files: %d\n",           nfiles);
 }
 
 /* ─── Mode: concurrent-rw ─────────────────────────────────── */

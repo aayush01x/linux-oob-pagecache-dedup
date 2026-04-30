@@ -107,7 +107,7 @@ def profile_size(bench, size_mb, test_dir, runs):
     run_cmd(f"cp {pa} {pb}")
 
     acc = dict(active_ns=0, hash_ns=0, compare_ns=0, merge_ns=0,
-               pages_deduped=0, pages_scanned=0)
+               mb_freed=0.0, mb_scanned=0.0)
 
     for i in range(runs):
         print(f"  [run {i+1}/{runs}] warm...", end="", flush=True)
@@ -116,13 +116,16 @@ def profile_size(bench, size_mb, test_dir, runs):
         print(" profile...", end="", flush=True)
         out = run_cmd([bench, "--eviction-profile", pa, pb])
         p = parse_kv(out)
-        print(f" deduped={p.get('eviction_pages_deduped','?')}")
-        acc["active_ns"]     += p.get("eviction_active_ns",  0)
-        acc["hash_ns"]       += p.get("eviction_hash_ns",    0)
-        acc["compare_ns"]    += p.get("eviction_compare_ns", 0)
-        acc["merge_ns"]      += p.get("eviction_merge_ns",   0)
-        acc["pages_deduped"] += p.get("eviction_pages_deduped", 0)
-        acc["pages_scanned"] += p.get("eviction_pages_scanned", 0)
+        mb = p.get("eviction_mb_freed", p.get("eviction_pages_deduped", 0) * 4096 / (1024*1024))
+        print(f" freed={mb:.2f} MB")
+        acc["active_ns"]  += p.get("eviction_active_ns",  0)
+        acc["hash_ns"]    += p.get("eviction_hash_ns",    0)
+        acc["compare_ns"] += p.get("eviction_compare_ns", 0)
+        acc["merge_ns"]   += p.get("eviction_merge_ns",   0)
+        acc["mb_freed"]   += float(p.get("eviction_mb_freed",
+                              p.get("eviction_pages_deduped", 0) * 4096 / (1024*1024)))
+        acc["mb_scanned"] += float(p.get("eviction_mb_scanned",
+                              p.get("eviction_pages_scanned", 0) * 4096 / (1024*1024)))
 
     for path in [pa, pb]:
         try: os.remove(path)
@@ -133,7 +136,7 @@ def profile_size(bench, size_mb, test_dir, runs):
 # ── Output ────────────────────────────────────────────────────────────────────
 def print_table(results, sizes):
     hdr = f"{'Size':>10} {'Active (ms)':>14} {'Hash (ms)':>12} " \
-          f"{'Compare (ms)':>14} {'Merge (ms)':>12}"
+          f"{'Compare (ms)':>14} {'Merge (ms)':>12} {'MB Freed':>10}"
     sep = "-"*len(hdr)
     print(f"\n{sep}\n  Table 1: Profiling Data Breakdown\n{sep}\n{hdr}\n{sep}")
     for sz in sizes:
@@ -141,7 +144,8 @@ def print_table(results, sizes):
         print(f"{sz:>10} {ns_to_ms(d['active_ns']):>14.3f} "
               f"{ns_to_ms(d['hash_ns']):>12.3f} "
               f"{ns_to_ms(d['compare_ns']):>14.3f} "
-              f"{ns_to_ms(d['merge_ns']):>12.3f}")
+              f"{ns_to_ms(d['merge_ns']):>12.3f} "
+              f"{d['mb_freed']:>10.2f}")
     print(sep+"\n")
 
 def write_latex(results, sizes, path):
